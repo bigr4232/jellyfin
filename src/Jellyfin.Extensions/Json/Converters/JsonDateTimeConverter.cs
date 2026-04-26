@@ -6,8 +6,7 @@ using System.Text.Json.Serialization;
 namespace Jellyfin.Extensions.Json.Converters
 {
     /// <summary>
-    /// Legacy DateTime converter.
-    /// Milliseconds aren't output if zero by default.
+    /// DateTime converter that emits ISO 8601 with exactly 3 fractional-second digits.
     /// </summary>
     public class JsonDateTimeConverter : JsonConverter<DateTime>
     {
@@ -20,15 +19,10 @@ namespace Jellyfin.Extensions.Json.Converters
         /// <inheritdoc />
         public override void Write(Utf8JsonWriter writer, DateTime value, JsonSerializerOptions options)
         {
-            if (value.Millisecond == 0)
-            {
-                // Remaining ticks value will be 0, manually format.
-                writer.WriteStringValue(value.ToString("yyyy'-'MM'-'dd'T'HH':'mm':'ss'.'fffffffZ", CultureInfo.InvariantCulture));
-            }
-            else
-            {
-                writer.WriteStringValue(value);
-            }
+            // Swift's JSONDecoder iso8601 strategy with withFractionalSeconds requires exactly 3
+            // fractional digits; the .NET round-trip ("O") format emits up to 7, which Swift rejects
+            // and breaks the native iOS app's SyncPlay clock-offset decoding.
+            writer.WriteStringValue(value.ToString("yyyy-MM-ddTHH:mm:ss.fffK", CultureInfo.InvariantCulture));
         }
     }
 }
