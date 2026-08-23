@@ -4,6 +4,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Threading;
+using System.Threading.Tasks;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.Session;
 using MediaBrowser.Controller.SyncPlay;
@@ -79,6 +80,12 @@ namespace Emby.Server.Implementations.SyncPlay
         /// </summary>
         private readonly Timer _groupWaitTimer;
 
+        /// <summary>
+        /// The map between sessions and the cancellation source of their pending leave group operation.
+        /// </summary>
+        private readonly ConcurrentDictionary<string, CancellationTokenSource> _pendingLeaves =
+            new ConcurrentDictionary<string, CancellationTokenSource>(StringComparer.OrdinalIgnoreCase);
+
         private bool _disposed = false;
 
         /// <summary>
@@ -100,6 +107,7 @@ namespace Emby.Server.Implementations.SyncPlay
             _libraryManager = libraryManager;
             _logger = loggerFactory.CreateLogger<SyncPlayManager>();
             _sessionManager.SessionEnded += OnSessionEnded;
+            _sessionManager.SessionControllerConnected += OnSessionControllerConnected;
             _groupWaitTimer = new Timer(_ => OnGroupWaitTimerTick(), null, Timeout.Infinite, Timeout.Infinite);
         }
 
@@ -109,11 +117,46 @@ namespace Emby.Server.Implementations.SyncPlay
         /// <value>The group-wait timeout.</value>
         internal long GroupWaitTimeout { get; init; } = Group.DefaultGroupWaitTimeout;
 
+        /// <summary>
+        /// Gets or sets the grace period between a session ending and its eviction from its group.
+        /// </summary>
+        /// <value>The eviction grace period.</value>
+        internal TimeSpan EvictionGracePeriod { get; set; } = TimeSpan.FromSeconds(30);
+
         /// <inheritdoc />
         public void Dispose()
         {
             Dispose(true);
             GC.SuppressFinalize(this);
+        }
+
+        /// <summary>
+        /// Releases unmanaged and optionally managed resources.
+        /// </summary>
+        /// <param name="disposing"><c>true</c> to release both managed and unmanaged resources; <c>false</c> to release only unmanaged resources.</param>
+        protected virtual void Dispose(bool disposing)
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            _sessionManager.SessionEnded -= OnSessionEnded;
+            _sessionManager.SessionControllerConnected -= OnSessionControllerConnected;
+
+            foreach (var pendingLeave in _pendingLeaves.Values)
+            {
+                pendingLeave.Cancel();
+                pendingLeave.Dispose();
+            }
+
+            _pendingLeaves.Clear();
+
+            lock (_groupsLock)
+            {
+                _disposed = true;
+                _groupWaitTimer.Dispose();
+            }
         }
 
         /// <inheritdoc />
@@ -204,6 +247,9 @@ namespace Emby.Server.Implementations.SyncPlay
                         {
                             // Restore session. The session is already in the group and has already
                             // been counted, so the counter must not be incremented a second time.
+                            // Cancel any eviction still pending from a recent disconnect so the
+                            // membership survives the reconnect.
+                            CancelPendingLeave(session.Id);
                             group.SessionJoin(session, request, cancellationToken);
                             return;
                         }
@@ -255,6 +301,9 @@ namespace Emby.Server.Implementations.SyncPlay
                         {
                             throw new InvalidOperationException("Could not remove session from group!");
                         }
+
+                        // The session is leaving for good; cancel any pending eviction.
+                        CancelPendingLeave(session.Id);
 
                         UpdateSessionsCounter(session.UserId, -1);
                         group.SessionLeave(session, request, cancellationToken);
@@ -394,26 +443,6 @@ namespace Emby.Server.Implementations.SyncPlay
             return false;
         }
 
-        /// <summary>
-        /// Releases unmanaged and optionally managed resources.
-        /// </summary>
-        /// <param name="disposing"><c>true</c> to release both managed and unmanaged resources; <c>false</c> to release only unmanaged resources.</param>
-        protected virtual void Dispose(bool disposing)
-        {
-            if (_disposed)
-            {
-                return;
-            }
-
-            _sessionManager.SessionEnded -= OnSessionEnded;
-
-            lock (_groupsLock)
-            {
-                _disposed = true;
-                _groupWaitTimer.Dispose();
-            }
-        }
-
         private void UpdateGroupWaitTimer()
         {
             if (_disposed)
@@ -456,10 +485,57 @@ namespace Emby.Server.Implementations.SyncPlay
         {
             var session = e.SessionInfo;
 
-            if (_sessionToGroupMap.TryGetValue(session.Id, out _))
+            if (!_sessionToGroupMap.ContainsKey(session.Id))
             {
-                var leaveGroupRequest = new LeaveGroupRequest();
-                LeaveGroup(session, leaveGroupRequest, CancellationToken.None);
+                return;
+            }
+
+            // Session ids are stable across reconnects, so the session may come back
+            // under the same id before it is clear that it is gone for good.
+            // Defer the eviction until the grace period has elapsed.
+            CancelPendingLeave(session.Id);
+
+            var cts = new CancellationTokenSource();
+            _pendingLeaves[session.Id] = cts;
+
+            _ = LeaveGroupWhenDisconnected(session, cts.Token);
+        }
+
+        private void OnSessionControllerConnected(object sender, SessionEventArgs e)
+        {
+            // A socket attaching to a session with a pending eviction means it reconnected,
+            // so cancel the eviction and let the membership survive.
+            CancelPendingLeave(e.SessionInfo.Id);
+        }
+
+        private void CancelPendingLeave(string sessionId)
+        {
+            if (_pendingLeaves.TryRemove(sessionId, out var cts))
+            {
+                cts.Cancel();
+                cts.Dispose();
+            }
+        }
+
+        private async Task LeaveGroupWhenDisconnected(SessionInfo session, CancellationToken cancellationToken)
+        {
+            try
+            {
+                await Task.Delay(EvictionGracePeriod, cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                // The session reconnected or left the group; no eviction needed.
+                return;
+            }
+
+            try
+            {
+                LeaveGroup(session, new LeaveGroupRequest(), CancellationToken.None);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error evicting session {SessionId} from its group.", session.Id);
             }
         }
 
