@@ -400,7 +400,13 @@ namespace Jellyfin.Server.Implementations.Tests.Plugins
 
             var versionInfo = fixture.Create<VersionInfo>();
             versionInfo.Version = new Version(1, 0).ToString();
-            versionInfo.Timestamp = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture);
+
+            // The manifest is written through JsonDefaults, whose JsonDateTimeConverter emits
+            // exactly three fractional-second digits, so sub-millisecond ticks do not survive
+            // the round trip the manifest assertions make.
+            var timestamp = DateTime.UtcNow;
+            timestamp = timestamp.AddTicks(-(timestamp.Ticks % TimeSpan.TicksPerMillisecond));
+            versionInfo.Timestamp = timestamp.ToString("o", CultureInfo.InvariantCulture);
 
             var packageInfo = fixture.Create<PackageInfo>();
             packageInfo.Versions = new[] { versionInfo };
