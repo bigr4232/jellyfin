@@ -1,6 +1,7 @@
 #nullable disable
 
 using System;
+using System.Collections.Generic;
 using System.Threading;
 using MediaBrowser.Controller.Session;
 using MediaBrowser.Controller.SyncPlay.PlaybackRequests;
@@ -18,9 +19,19 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
     public class WaitingGroupState : AbstractGroupState
     {
         /// <summary>
+        /// Maximum corrective seeks before a session is left behind rather than looped on.
+        /// </summary>
+        private const int MaxCorrectionAttempts = 5;
+
+        /// <summary>
         /// The logger.
         /// </summary>
         private readonly ILogger<WaitingGroupState> _logger;
+
+        /// <summary>
+        /// Number of corrective seeks issued per session during this waiting cycle.
+        /// </summary>
+        private readonly Dictionary<string, int> _correctionAttempts = new();
 
         /// <summary>
         /// Initializes a new instance of the <see cref="WaitingGroupState"/> class.
@@ -452,18 +463,31 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
                 // it has no clue of the real position nor the playback state.
                 if (!request.IsPlaying && Math.Abs(delayTicks) > maxPlaybackOffsetTicks)
                 {
-                    // Session not ready at all.
-                    context.SetBuffering(session, true);
+                    var attempts = RegisterCorrectionAttempt(session.Id);
+                    if (attempts <= MaxCorrectionAttempts)
+                    {
+                        // Session not ready at all.
+                        context.SetBuffering(session, true);
 
-                    // Correcting session's position.
-                    var command = context.NewSyncPlayCommand(SendCommandType.Seek);
-                    context.SendCommand(session, SyncPlayBroadcastType.CurrentSession, command, cancellationToken);
+                        // Correcting session's position.
+                        var command = context.NewSyncPlayCommand(SendCommandType.Seek);
+                        context.SendCommand(session, SyncPlayBroadcastType.CurrentSession, command, cancellationToken);
 
-                    // Notify relevant state change event.
-                    SendGroupStateUpdate(context, request, session, cancellationToken);
+                        // Notify relevant state change event.
+                        SendGroupStateUpdate(context, request, session, cancellationToken);
 
-                    _logger.LogWarning("Session {SessionId} got lost in time, correcting.", session.Id);
-                    return;
+                        _logger.LogWarning("Session {SessionId} got lost in time, correcting.", session.Id);
+                        return;
+                    }
+
+                    // The corrections are not getting through: the client cannot reach the
+                    // group position (slow transcode, bad clock, unseekable stream).
+                    // Treat it as ready so the group is not held back by it.
+                    _logger.LogWarning(
+                        "Session {SessionId} is still lost in time after {Attempts} corrections in group {GroupId}; proceeding without it.",
+                        session.Id,
+                        attempts,
+                        context.GroupId.ToString());
                 }
 
                 // Session is ready.
@@ -471,6 +495,42 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
 
                 if (context.IsBuffering())
                 {
+                    // A negative delay means this client is *ahead* of the group.
+                    // Scheduling a command in the past makes the client fire it
+                    // immediately and land further out of position, so correct it.
+                    if (delayTicks < 0)
+                    {
+                        var attempts = RegisterCorrectionAttempt(session.Id);
+                        if (attempts <= MaxCorrectionAttempts)
+                        {
+                            // Session is ahead of the group, put it back to buffering
+                            // while it seeks to the group position.
+                            context.SetBuffering(session, true);
+
+                            var seek = context.NewSyncPlayCommand(SendCommandType.Seek);
+                            context.SendCommand(session, SyncPlayBroadcastType.CurrentSession, seek, cancellationToken);
+
+                            // Notify relevant state change event.
+                            SendGroupStateUpdate(context, request, session, cancellationToken);
+
+                            _logger.LogWarning("Session {SessionId} is ahead of group {GroupId} by {Delay} seconds, correcting.", session.Id, context.GroupId.ToString(), TimeSpan.FromTicks(-delayTicks).TotalSeconds);
+                            return;
+                        }
+
+                        // The client cannot seek back to the group position (slow transcode,
+                        // bad clock, unseekable stream). Stop correcting: looping starves it
+                        // further and restarts its transcode on every seek. Pause it where it
+                        // is instead, so it stops drifting further ahead while the group
+                        // waits, and leave it out of the buffering set so the group proceeds.
+                        _logger.LogWarning(
+                            "Session {SessionId} is still ahead of group {GroupId} after {Attempts} corrections; pausing it in place.",
+                            session.Id,
+                            context.GroupId.ToString(),
+                            attempts);
+
+                        delayTicks = 0;
+                    }
+
                     // Others are still buffering, tell this client to pause when ready.
                     var command = context.NewSyncPlayCommand(SendCommandType.Pause);
                     command.When = currentTime.AddTicks(delayTicks);
@@ -522,17 +582,37 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
                 // Check that session is really ready, tolerate player imperfections under a certain threshold.
                 if (Math.Abs(context.PositionTicks - requestTicks) > maxPlaybackOffsetTicks)
                 {
-                    // Session still not ready.
-                    context.SetBuffering(session, true);
-                    // Session is seeking to wrong position, correcting.
-                    var command = context.NewSyncPlayCommand(SendCommandType.Seek);
-                    context.SendCommand(session, SyncPlayBroadcastType.CurrentSession, command, cancellationToken);
+                    var attempts = RegisterCorrectionAttempt(session.Id);
+                    if (attempts <= MaxCorrectionAttempts)
+                    {
+                        // Session still not ready.
+                        context.SetBuffering(session, true);
+                        // Session is seeking to wrong position, correcting.
+                        var command = context.NewSyncPlayCommand(SendCommandType.Seek);
+                        context.SendCommand(session, SyncPlayBroadcastType.CurrentSession, command, cancellationToken);
 
-                    // Notify relevant state change event.
-                    SendGroupStateUpdate(context, request, session, cancellationToken);
+                        // Notify relevant state change event.
+                        SendGroupStateUpdate(context, request, session, cancellationToken);
 
-                    _logger.LogWarning("Session {SessionId} is seeking to wrong position, correcting.", session.Id);
-                    return;
+                        _logger.LogWarning("Session {SessionId} is seeking to wrong position, correcting.", session.Id);
+                        return;
+                    }
+
+                    // The client cannot reach the group position (slow transcode, bad clock,
+                    // unseekable stream). Stop correcting: looping starves it further and
+                    // restarts its transcode on every seek. It is treated as ready from here
+                    // on, desynced, so that the group is not held in the waiting state by it.
+                    _logger.LogWarning(
+                        "Session {SessionId} failed to reach position after {Attempts} corrections in group {GroupId}; proceeding without it.",
+                        session.Id,
+                        attempts,
+                        context.GroupId.ToString());
+                }
+                else
+                {
+                    // Session reached the group position, so it gets a fresh budget
+                    // of corrections should it drift again.
+                    _correctionAttempts.Remove(session.Id);
                 }
 
                 // Session is ready.
@@ -676,6 +756,20 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
                     context.SetState(pausedState);
                 }
             }
+        }
+
+        /// <summary>
+        /// Registers a corrective action issued for a session during this waiting cycle.
+        /// </summary>
+        /// <param name="sessionId">The session identifier.</param>
+        /// <returns>The number of corrections issued so far, including this one.</returns>
+        private int RegisterCorrectionAttempt(string sessionId)
+        {
+            _correctionAttempts.TryGetValue(sessionId, out var attempts);
+            attempts++;
+            _correctionAttempts[sessionId] = attempts;
+
+            return attempts;
         }
     }
 }
