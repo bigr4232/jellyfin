@@ -495,10 +495,12 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
 
                 if (context.IsBuffering())
                 {
-                    // A negative delay means this client is *ahead* of the group.
-                    // Scheduling a command in the past makes the client fire it
-                    // immediately and land further out of position, so correct it.
-                    if (delayTicks < 0)
+                    // A delay negative by more than the playback offset means this
+                    // client is *ahead* of the group. Scheduling a command in the
+                    // past makes the client fire it immediately and land further out
+                    // of position, so correct it. Smaller negative delays are the
+                    // one-way latency of the Ready report, not a real desync.
+                    if (delayTicks < -maxPlaybackOffsetTicks)
                     {
                         var attempts = RegisterCorrectionAttempt(session.Id);
                         if (attempts <= MaxCorrectionAttempts)
@@ -530,6 +532,10 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
 
                         delayTicks = 0;
                     }
+
+                    // Clamp sub-tolerance jitter so the pause is never dated in
+                    // the past, which the client would fire immediately.
+                    delayTicks = Math.Max(delayTicks, 0);
 
                     // Others are still buffering, tell this client to pause when ready.
                     var command = context.NewSyncPlayCommand(SendCommandType.Pause);

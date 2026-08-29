@@ -93,6 +93,25 @@ namespace Jellyfin.Server.Implementations.Tests.SyncPlay
         }
 
         [Fact]
+        public void HandleRequest_Ready_SlightlyAheadWithinTolerance_SchedulesPauseNow()
+        {
+            _state.ResumePlaying = true;
+            _context.PositionTicks = 0;
+
+            var before = DateTime.UtcNow;
+            HandleReady(ReadyRequest(TimeSpan.FromMilliseconds(200).Ticks, isPlaying: true));
+            var after = DateTime.UtcNow;
+
+            // A sub-tolerance lead is the one-way latency of the Ready report, not
+            // a real desync: the session is not corrected, and its pause is never
+            // dated in the past.
+            var command = Assert.Single(_context.Commands);
+            Assert.Equal(SendCommandType.Pause, command.Command);
+            Assert.InRange(command.When, before, after);
+            Assert.False(_context.IsBuffering(_session.Id));
+        }
+
+        [Fact]
         public void HandleRequest_Ready_AheadOfGroup_StopsCorrectingAfterMaxAttempts()
         {
             _state.ResumePlaying = true;
