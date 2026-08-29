@@ -180,6 +180,88 @@ namespace Jellyfin.Server.Implementations.Tests.SyncPlay
         }
 
         [Fact]
+        public void HandleRequest_Ready_BehindGroupBeyondTolerance_SendsSeekCorrection()
+        {
+            _state.ResumePlaying = true;
+            _context.PositionTicks = TimeSpan.FromSeconds(100).Ticks;
+
+            // Nobody else is buffering, so this session is the last one the group waits on.
+            _context.SetBuffering(_otherSession, false);
+
+            HandleReady(ReadyRequest(0, isPlaying: true));
+
+            // A session this far behind is in the wrong place, not lagging: it is
+            // corrected and the group stays in the waiting state for it.
+            var command = Assert.Single(_context.Commands);
+            Assert.Equal(SendCommandType.Seek, command.Command);
+            Assert.True(_context.IsBuffering(_session.Id));
+        }
+
+        [Fact]
+        public void HandleRequest_Ready_BehindGroupBeyondTolerance_StopsCorrectingAfterMaxAttempts()
+        {
+            _state.ResumePlaying = true;
+            _context.PositionTicks = TimeSpan.FromSeconds(100).Ticks;
+
+            _context.SetBuffering(_otherSession, false);
+
+            var before = DateTime.UtcNow;
+            for (var i = 0; i < 6; i++)
+            {
+                HandleReady(ReadyRequest(0, isPlaying: true));
+            }
+
+            // At most 5 corrective seeks. The session is then left behind and the
+            // group resumes with the standard recovery delay instead of waiting the
+            // full gap for it to arrive.
+            Assert.Equal(5, _context.Commands.Count(c => c.Command == SendCommandType.Seek));
+
+            var unpause = Assert.Single(_context.Commands, c => c.Command == SendCommandType.Unpause);
+            Assert.True(unpause.When < before.AddSeconds(5));
+            Assert.IsType<PlayingGroupState>(_context.State);
+        }
+
+        [Fact]
+        public void HandleRequest_Ready_BehindGroupWithinTolerance_ResumesWhenCatchingUp()
+        {
+            _state.ResumePlaying = true;
+            _context.PositionTicks = TimeSpan.FromSeconds(1).Ticks;
+            _context.HighestPing = 100;
+
+            _context.SetBuffering(_otherSession, false);
+
+            var before = DateTime.UtcNow;
+            // 400 ms behind: more than twice the ping, so the group waits for the
+            // session to catch up by playing, but the wait stays within the bound.
+            HandleReady(ReadyRequest(TimeSpan.FromMilliseconds(600).Ticks, isPlaying: true));
+            var after = DateTime.UtcNow;
+
+            var command = Assert.Single(_context.Commands);
+            Assert.Equal(SendCommandType.Unpause, command.Command);
+            Assert.InRange(command.When, before.AddMilliseconds(350), after.AddMilliseconds(450));
+        }
+
+        [Fact]
+        public void HandleRequest_Ready_ResumingWithLowPing_FloorsRecoveryDelayAtDefaultPing()
+        {
+            _state.ResumePlaying = true;
+            _context.PositionTicks = 0;
+            _context.HighestPing = 100;
+
+            _context.SetBuffering(_otherSession, false);
+
+            var before = DateTime.UtcNow;
+            HandleReady(ReadyRequest(0, isPlaying: true));
+            var after = DateTime.UtcNow;
+
+            // DefaultPing is in milliseconds, so the floor is 500 ms, not the
+            // 200 ms twice-ping value a ticks-vs-milliseconds comparison yields.
+            var command = Assert.Single(_context.Commands);
+            Assert.Equal(SendCommandType.Unpause, command.Command);
+            Assert.InRange(command.When, before.AddMilliseconds(450), after.AddMilliseconds(550));
+        }
+
+        [Fact]
         public void HandleRequest_Ready_OutOfTolerance_SendsSeekCorrection()
         {
             _state.ResumePlaying = false;
@@ -292,6 +374,8 @@ namespace Jellyfin.Server.Implementations.Tests.SyncPlay
 
             public long DefaultPing { get; set; } = 500;
 
+            public long HighestPing { get; set; } = 500;
+
             public long TimeSyncOffset { get; set; } = 2000;
 
             public long MaxPlaybackOffset { get; set; } = 500;
@@ -323,12 +407,14 @@ namespace Jellyfin.Server.Implementations.Tests.SyncPlay
 
             public long GetHighestPing()
             {
-                return DefaultPing;
+                return HighestPing;
             }
 
             public SendCommand NewSyncPlayCommand(SendCommandType type)
             {
-                return new SendCommand(GroupId, PlaylistItemId, DateTime.UtcNow, type, null, DateTime.UtcNow);
+                // Mirrors Group.NewSyncPlayCommand: commands are dated at the
+                // group's LastActivity, which is what the resume paths schedule.
+                return new SendCommand(GroupId, PlaylistItemId, LastActivity, type, PositionTicks, DateTime.UtcNow);
             }
 
             public long SanitizePositionTicks(long? positionTicks)

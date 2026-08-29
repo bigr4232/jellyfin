@@ -340,7 +340,9 @@ Note this also partially mitigates Symptom B: fewer forced rejoins means fewer
 
 ### HIGH — Sync correctness on browser
 
-**2. Unit-mismatch bug in late-recovery clamp**
+**2. Unit-mismatch bug in late-recovery clamp — ✅ FIXED**
+
+> **Status:** Fixed 2026-08-29, together with #21, as suggested. The floor is now `context.DefaultPing * TimeSpan.TicksPerMillisecond`, so the clamp compares ticks to ticks and actually fires when twice the highest ping drops below the default ping. Unit test: `HandleRequest_Ready_ResumingWithLowPing_FloorsRecoveryDelayAtDefaultPing` (highest ping 100 ms against the 500 ms default: the scheduled resume lands at the 500 ms floor, not the 200 ms twice-ping value the buggy comparison yields). All 20 SyncPlay tests pass.
 
 [MediaBrowser.Controller/SyncPlay/GroupStates/WaitingGroupState.cs:562-563](MediaBrowser.Controller/SyncPlay/GroupStates/WaitingGroupState.cs#L562-L563)
 (cited as 502-503 before the #16/#17 fixes shifted the file)
@@ -737,7 +739,9 @@ measured at the group position — `Math.Abs(delayTicks) <= maxPlaybackOffsetTic
 both branches follow the same rule. With #19 applied, that is the same predicate the
 corrected guard uses, so the two changes share one tolerance constant.
 
-**21. Unbounded `LastActivity` push schedules the group's resume arbitrarily far ahead**
+**21. Unbounded `LastActivity` push schedules the group's resume arbitrarily far ahead — ✅ FIXED**
+
+> **Status:** Fixed 2026-08-29, together with #2, as suggested. The resume delay is now bounded by `MaxPlaybackOffset`: a session more than 500 ms behind the group when it is the last one ready is corrected under the shared correction budget (same `RegisterCorrectionAttempt` mechanism as #16/#17) instead of pushing `LastActivity` out by its full gap — the 2026-08-29 rejoin-at-0 scenario now seeks the session to the group position and resumes normally. After 5 corrections the session is left behind and the group resumes with the standard recovery delay; the give-up falls through to the bounded resume rather than returning, so it cannot strand the group in Waiting. Unit tests: `HandleRequest_Ready_BehindGroupBeyondTolerance_SendsSeekCorrection`, `HandleRequest_Ready_BehindGroupBeyondTolerance_StopsCorrectingAfterMaxAttempts` (asserts the resume is dated seconds out, not minutes), `HandleRequest_Ready_BehindGroupWithinTolerance_ResumesWhenCatchingUp` (inbound lag between 2×ping and the bound still schedules the wait). The test fake's `NewSyncPlayCommand` now mirrors `Group.NewSyncPlayCommand` (`When = LastActivity`), which is what makes the bound observable, and its `GetHighestPing` was decoupled from `DefaultPing` to expose #2. All 20 SyncPlay tests pass.
 
 [WaitingGroupState.cs:544-557](MediaBrowser.Controller/SyncPlay/GroupStates/WaitingGroupState.cs#L544-L557)
 
@@ -845,6 +849,53 @@ separately.
 **Reproduce (definitive):** two clients in a group, playing. Kill client B's player
 process (leaving the WebSocket up, so #15's grace period does not apply) and then seek
 from client A. The group enters `Waiting` and never leaves it.
+
+**23. Behind-the-group sessions are only bounded when they are the last one ready**
+
+[WaitingGroupState.cs:545-554](MediaBrowser.Controller/SyncPlay/GroupStates/WaitingGroupState.cs#L545-L554)
+
+#19 gave the ahead-of-group test a tolerance band and #21 bounded the behind-the-group
+resume, but those two live in different branches of the same `if`, so after both fixes
+one quadrant is still unbounded:
+
+| session is… | others still buffering | it is the last one ready |
+| --- | --- | --- |
+| ahead beyond tolerance | corrected under the shared budget (#16/#19) | group resumes at the standard delay; the `Unpause` carries `PositionTicks`, which re-seeks it |
+| behind beyond tolerance | **`Pause` dated `delayTicks` in the future — unbounded** | corrected under the shared budget (#21) |
+
+The clamp added with #19 is one-sided: `Math.Max(delayTicks, 0)` at
+[line 547](MediaBrowser.Controller/SyncPlay/GroupStates/WaitingGroupState.cs#L547)
+puts a floor under the value but no ceiling, so a session reporting `Ready` a long way
+behind the group while someone else is still buffering is told to pause at
+`currentTime.AddTicks(delayTicks)`. For the 2026-08-29 rejoin-at-0 shape that is a pause
+scheduled 35 minutes out — the client never pauses and plays on from its stale position
+for the rest of the waiting cycle. The identical condition one branch over is now
+treated as "in the wrong place, correct it."
+
+**Self-limiting, which is why this is low priority rather than a repeat of #21.** The
+session is already marked not-buffering, so it does not hold the group; and when the
+group resumes, every member gets an `Unpause` carrying `context.PositionTicks`
+([Group.cs:417-426](Emby.Server.Implementations/SyncPlay/Group.cs#L417-L426)), which
+re-seeks it. The exposure is bounded by however long the group stays in `Waiting` —
+seconds in the normal case, and only unbounded if #22 also bites.
+
+**No live trigger observed.** Every large offset in the 2026-08-23 and 2026-08-29 logs
+was either ahead of the group (`is ahead of group … by 183.3506592 seconds`) or belonged
+to the last-ready session (`will resume in 2106.9428685 seconds`). This is a structural
+gap found by reading the fixed code, not a reproduction — same status as finding #11.
+
+**Reproduce (definitive):** three sessions in a group, playing. Seek from A. Have B
+report `Ready` with a stale position far behind the seek target *while C has not yet
+reported*. Server logs `will pause when ready in {large} seconds`; inspect B's
+`SyncPlayCommand` frame and confirm `When` is minutes out, and that B keeps playing.
+
+Suggested fix — mirror #21's guard in this branch, correcting a session more than
+`MaxPlaybackOffset` behind under the shared `RegisterCorrectionAttempt` budget rather
+than scheduling its pause arbitrarily far ahead. **Deliberately not applied alongside
+#21:** "pause when ready in N seconds" is the upstream design for a client that is
+genuinely lagging by a few hundred milliseconds, and narrowing it also affects the
+`SessionJoined` and `Buffer` flows that route through this same branch. Worth doing as
+its own change, checking the `IgnoreGroupWait` interaction from #5 at the same time.
 
 ---
 
@@ -1052,20 +1103,19 @@ End-to-end:
 
 In rough priority:
 
-1. **Repair the seek-while-playing path in `WaitingGroupState` (findings #19, #20, #21 + #2).**
-   This is the active user-facing bug — scrubbing ahead does not re-sync the group, and
-   pause/play is the only recovery. ~~#19 and #20 are regressions the #16/#17 fixes left
-   behind;~~ #19 and #20 are done — see their findings. #21 and #2 are the two halves of
-   the resume-delay branch and must land together. All four are local changes inside one
-   method
-   ([WaitingGroupState.cs:459-578](MediaBrowser.Controller/SyncPlay/GroupStates/WaitingGroupState.cs#L459-L578))
-   and share one tolerance constant, so they are best done as a single pass with tests
-   added to the existing `WaitingGroupStateTests.cs`.
+1. ~~**Repair the seek-while-playing path in `WaitingGroupState` (findings #19, #20, #21 + #2).**~~
+   Done — #19, #20, #21 and #2 are all fixed; see their findings. (This was the active
+   user-facing bug — scrubbing ahead did not re-sync the group, and pause/play was the
+   only recovery. #19 and #20 were regressions the #16/#17 fixes left behind; #21 and
+   #2 were the two halves of the resume-delay branch and landed together. All four were
+   local changes inside one method, sharing one tolerance constant, with tests added to
+   the existing `WaitingGroupStateTests.cs`.)
 2. ~~**Add a disconnect grace period before SyncPlay eviction (finding #15).**~~ Done — see finding #15.
 3. ~~**Guard the negative `delayTicks` path and cap the correction loop (findings #16 and #17).** These must land together; see the note at the end of #16.~~ Done, but each left a regression — see #19 and #20.
 4. Investigate the [#139](https://github.com/jellyfin/jellyfin-desktop/issues/139) symptom with the `IgnoreGroupWait` interaction (finding #5).
 5. Add `[Authorize]` to the `Ping` endpoint (finding #6). ~~Guard the empty-Guid throw (finding #18).~~ Done — see finding #18. Both are the same policy layer, so #6 is still worth one pass.
 6. Add a `Waiting`-state timeout so a silent participant cannot strand the group (finding #22). Deferred from item 1 — it needs a per-group timer with real lifecycle concerns, and #19–#21 cover every desync observed so far.
-7. Refactor `Group.SendGroupUpdate` / `SendCommand` to await tasks under serialized access (finding #3 — biggest correctness lift but largest scope).
-8. Raise the 2-second time-sync threshold or make it adaptive (finding #4).
-9. Add null-guards on `_libraryManager.GetItemById` results (finding #9).
+7. Bound the future-dated Pause for a session behind the group while others are still buffering (finding #23) — the one quadrant #19 and #21 left open. Structural, no live trigger observed; pairs naturally with finding #5.
+8. Refactor `Group.SendGroupUpdate` / `SendCommand` to await tasks under serialized access (finding #3 — biggest correctness lift but largest scope).
+9. Raise the 2-second time-sync threshold or make it adaptive (finding #4).
+10. Add null-guards on `_libraryManager.GetItemById` results (finding #9).

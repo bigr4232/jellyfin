@@ -558,6 +558,43 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
                 {
                     // If all ready, then start playback.
                     // Let other clients resume as soon as the buffering client catches up.
+                    if (delayTicks > maxPlaybackOffsetTicks)
+                    {
+                        // The session is not lagging, it is in the wrong place
+                        // (a rejoin at position 0, a seek that never landed).
+                        // Correct it under the shared correction budget rather
+                        // than scheduling the group's resume arbitrarily far ahead.
+                        var attempts = RegisterCorrectionAttempt(session.Id);
+                        if (attempts <= MaxCorrectionAttempts)
+                        {
+                            // Session is behind the group, put it back to buffering
+                            // while it seeks to the group position.
+                            context.SetBuffering(session, true);
+
+                            var seek = context.NewSyncPlayCommand(SendCommandType.Seek);
+                            context.SendCommand(session, SyncPlayBroadcastType.CurrentSession, seek, cancellationToken);
+
+                            // Notify relevant state change event.
+                            SendGroupStateUpdate(context, request, session, cancellationToken);
+
+                            _logger.LogWarning("Session {SessionId} is behind group {GroupId} by {Delay} seconds, correcting.", session.Id, context.GroupId.ToString(), TimeSpan.FromTicks(delayTicks).TotalSeconds);
+                            return;
+                        }
+
+                        // The client cannot reach the group position (slow transcode,
+                        // bad clock, unseekable stream). Stop correcting: looping starves
+                        // it further and restarts its transcode on every seek. Leave it
+                        // behind and resume the group with the standard recovery delay,
+                        // not its full gap.
+                        _logger.LogWarning(
+                            "Session {SessionId} is still behind group {GroupId} after {Attempts} corrections; proceeding without it.",
+                            session.Id,
+                            context.GroupId.ToString(),
+                            attempts);
+
+                        delayTicks = 0;
+                    }
+
                     if (delayTicks > context.GetHighestPing() * 2 * TimeSpan.TicksPerMillisecond)
                     {
                         // Client that was buffering is recovering, notifying others to resume.
