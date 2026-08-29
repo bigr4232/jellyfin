@@ -490,6 +490,16 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
                         context.GroupId.ToString());
                 }
 
+                // Session reached the group position, so it gets a fresh budget of
+                // corrections should it drift again. Checked independently of the
+                // branch above: this is a property of where the session is, not of
+                // which correction path ran. A session that just gave up is excluded
+                // by the tolerance, so giving up never refreshes its own budget.
+                if (Math.Abs(delayTicks) <= maxPlaybackOffsetTicks)
+                {
+                    _correctionAttempts.Remove(session.Id);
+                }
+
                 // Session is ready.
                 context.SetBuffering(session, false);
 

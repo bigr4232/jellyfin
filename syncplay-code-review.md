@@ -649,7 +649,7 @@ Two judgement calls worth review before implementing:
 
 **19. Zero-tolerance "ahead of group" check bounces in-sync clients — regression from #16 — ✅ FIXED**
 
-> **Status:** Fixed 2026-08-29, as suggested. The guard is `delayTicks < -maxPlaybackOffsetTicks` — the same 500 ms tolerance the sibling comparisons use — and the fall-through clamps `delayTicks` to 0 before scheduling the Pause, so the relaxed band only ever absorbs sub-tolerance jitter. A 200 ms lead (one-way report latency) now produces an immediate pause with no Seek correction; a 100 s lead still corrects and gives up per #16/#17. Unit test: `HandleRequest_Ready_SlightlyAheadWithinTolerance_SchedulesPauseNow`; the existing ahead-of-group tests (100 s lead) are unchanged and passing. Note the #20 regression (budget reset on the `ResumePlaying` path) is a separate finding and remains open.
+> **Status:** Fixed 2026-08-29, as suggested. The guard is `delayTicks < -maxPlaybackOffsetTicks` — the same 500 ms tolerance the sibling comparisons use — and the fall-through clamps `delayTicks` to 0 before scheduling the Pause, so the relaxed band only ever absorbs sub-tolerance jitter. A 200 ms lead (one-way report latency) now produces an immediate pause with no Seek correction; a 100 s lead still corrects and gives up per #16/#17. Unit test: `HandleRequest_Ready_SlightlyAheadWithinTolerance_SchedulesPauseNow`; the existing ahead-of-group tests (100 s lead) are unchanged and passing. The #20 regression (budget reset on the `ResumePlaying` path) is a separate finding, fixed the same day — see #20.
 
 [WaitingGroupState.cs:500](MediaBrowser.Controller/SyncPlay/GroupStates/WaitingGroupState.cs#L500)
 
@@ -706,7 +706,9 @@ The `Math.Max` is what #16 rejected as a *standalone* fix, and that rejection st
 holds — but as the floor under a 500 ms tolerance band it only ever absorbs sub-tolerance
 jitter, which is exactly what it should do.
 
-**20. Correction budget never resets on the `ResumePlaying` path — regression from #17**
+**20. Correction budget never resets on the `ResumePlaying` path — regression from #17 — ✅ FIXED**
+
+> **Status:** Fixed 2026-08-29, as suggested. The `ResumePlaying == true` branch now resets `_correctionAttempts` wherever the session is measured at the group position — `Math.Abs(delayTicks) <= maxPlaybackOffsetTicks` — checked right after the lost-in-time branch, so a given-up session that is still out of tolerance never resets. Both branches now follow the same rule and, with #19 applied, share the one tolerance constant. Unit test: `HandleRequest_Ready_ConvergedSessionWhileResuming_ResetsCorrectionCounter` (exhausts the budget, converges, drifts again, and expects a fresh budget of 5 seeks). All 16 SyncPlay tests pass.
 
 `_correctionAttempts.Remove(session.Id)` appears once, in the `ResumePlaying == false`
 branch ([WaitingGroupState.cs:614](MediaBrowser.Controller/SyncPlay/GroupStates/WaitingGroupState.cs#L614)).
@@ -1052,9 +1054,10 @@ In rough priority:
 
 1. **Repair the seek-while-playing path in `WaitingGroupState` (findings #19, #20, #21 + #2).**
    This is the active user-facing bug — scrubbing ahead does not re-sync the group, and
-   pause/play is the only recovery. #19 and #20 are regressions the #16/#17 fixes left
-   behind; #21 and #2 are the two halves of the resume-delay branch and must land
-   together. All four are local changes inside one method
+   pause/play is the only recovery. ~~#19 and #20 are regressions the #16/#17 fixes left
+   behind;~~ #19 and #20 are done — see their findings. #21 and #2 are the two halves of
+   the resume-delay branch and must land together. All four are local changes inside one
+   method
    ([WaitingGroupState.cs:459-578](MediaBrowser.Controller/SyncPlay/GroupStates/WaitingGroupState.cs#L459-L578))
    and share one tolerance constant, so they are best done as a single pass with tests
    added to the existing `WaitingGroupStateTests.cs`.

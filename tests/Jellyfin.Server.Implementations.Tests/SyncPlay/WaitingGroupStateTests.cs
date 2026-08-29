@@ -253,6 +253,32 @@ namespace Jellyfin.Server.Implementations.Tests.SyncPlay
             Assert.True(_context.IsBuffering(_session.Id));
         }
 
+        [Fact]
+        public void HandleRequest_Ready_ConvergedSessionWhileResuming_ResetsCorrectionCounter()
+        {
+            _state.ResumePlaying = true;
+            _context.PositionTicks = 0;
+
+            // Exhaust the correction budget.
+            for (var i = 0; i < 5; i++)
+            {
+                HandleReady(ReadyRequest(TimeSpan.FromSeconds(100).Ticks, isPlaying: true));
+            }
+
+            // The session reaches the group position.
+            HandleReady(ReadyRequest(0, isPlaying: true));
+
+            // It drifts again: a full new budget of corrections is available,
+            // instead of the give-up branch re-firing on every Ready.
+            for (var i = 0; i < 5; i++)
+            {
+                HandleReady(ReadyRequest(TimeSpan.FromSeconds(100).Ticks, isPlaying: true));
+            }
+
+            Assert.Equal(10, _context.Commands.Count(c => c.Command == SendCommandType.Seek));
+            Assert.True(_context.IsBuffering(_session.Id));
+        }
+
         private sealed class FakeGroupStateContext : IGroupStateContext
         {
             private readonly Dictionary<string, bool> _buffering = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
