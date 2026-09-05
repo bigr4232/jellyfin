@@ -64,6 +64,21 @@ namespace MediaBrowser.Controller.SyncPlay
         void SetState(IGroupState state);
 
         /// <summary>
+        /// Schedules a timeout for the current state, replacing any pending one.
+        /// </summary>
+        /// <remarks>
+        /// The timeout is bound to the state that schedules it: it is dropped when the group
+        /// transitions to another state, and it fires under the group's lock.
+        /// </remarks>
+        /// <param name="delay">The delay after which the current state times out.</param>
+        void ScheduleStateTimeout(TimeSpan delay);
+
+        /// <summary>
+        /// Cancels the pending state timeout, if any.
+        /// </summary>
+        void CancelStateTimeout();
+
+        /// <summary>
         /// Sends a GroupUpdate message to the interested sessions.
         /// </summary>
         /// <param name="from">The current session.</param>

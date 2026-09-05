@@ -141,6 +141,76 @@ why the manual recovery works when the seek itself does not.
 
 ---
 
+## Observed incident — 2026-09-05
+
+Group `3111c115-a5a6-4c4e-9800-cd376e8c2c8f`, 05:51–06:33 UTC, two participants playing
+*Troy*, on the patched build (`dev` @ `664f6fb264`). Reported symptom, unchanged from
+2026-08-29: **scrubbing brings up the SyncPlay loading spinner and repeatedly pulls
+everyone back to the same spot.**
+
+This is the first incident recorded after the fixes for #19–#21 shipped. **The
+correction-loop storms those findings described are gone** — `log_20260905.log` contains
+not one `is seeking to wrong position, correcting`, `is ahead of group`, or `proceeding
+without it` line. What survives is a *different* cause that #19–#21 never addressed, and
+that finding #22 had already described and deliberately deferred.
+
+**Session identification**, extending the earlier tables:
+
+| SyncPlay session | User | Client | Basis |
+| --- | --- | --- | --- |
+| `5c88b88f54102663350603ce201a98d6` | bigr4232 | Jellium Desktop | carried over from the 2026-08-23 table |
+| `ecd9d85601e4ad1f8caa4e0a1e9636b7` | jimbo4994 | Jellyfin Desktop | `/Sessions` listing 06:41, `now_playing` *Troy* matching the group's item |
+
+### The group hangs in `Waiting` with nothing reported at all
+
+Two clean reproductions, 24 minutes apart. Every request that reaches a group is logged at
+Information level by
+[Group.HandleRequest](Emby.Server.Implementations/SyncPlay/Group.cs#L332-L349), so the
+silence below is real — not a logging-level artifact:
+
+```text
+05:52:29.609  ecd9 requested Seek in group "3111c115-…" that is Playing.
+05:52:29.609  Group "3111c115-…" switching from Playing to Waiting.
+05:52:30.359  ecd9 requested Seek in group "3111c115-…" that is Waiting.   <- user re-scrubs, still stuck
+              (9.4 seconds — no Ready, no Buffering, from either participant)
+05:52:39.818  5c88 requested Unpause in group "3111c115-…" that is Waiting. <- human presses play to escape
+05:52:42.515  5c88 requested Pause …
+05:52:43.241  5c88 requested Unpause …                                      <- the pause-then-play workaround
+05:52:44.267  Ready ×7
+
+06:16:42.024  ecd9 requested Seek in group "3111c115-…" that is Playing.
+06:16:42.024  Group "3111c115-…" switching from Playing to Waiting.
+              (5.6 seconds of total silence)
+06:16:47.625  5c88 requested Unpause in group "3111c115-…" that is Waiting. <- same manual escape
+06:16:48.684  5c88 requested Pause …
+06:16:50.021  5c88 requested Unpause …
+06:16:51.039  Ready ×6
+```
+
+Note the shape of the `Ready` bursts: they arrive only *after* an `Unpause`, never after a
+`Seek`, and they arrive in duplicate. Both facts are explained by the client, in finding
+#24 — `PlaybackCore.onReady()` sends a `Ready` and *then* emits the `'ready'` event whose
+handler sends another.
+
+This is byte-for-byte the shape recorded under finding #22's live evidence on 2026-08-29
+(33 s of silence after a seek, ended by a manual `Unpause`). It is the same defect, still
+open, and with #19–#21 fixed it is now the *only* thing standing between a scrub and a
+working re-sync.
+
+### One further live confirmation: finding #23
+
+The same log supplies the reproduction finding #23 said it lacked:
+
+```text
+05:52:28.094  Session "ecd9d856…" will pause when ready in 928.9321588 seconds.
+```
+
+A `Pause` dated 15.5 minutes in the future, issued on the `Play` path while the other
+participant was still buffering. That client never pauses, and plays on from its stale
+position for the rest of the waiting cycle.
+
+---
+
 ## Findings (prioritized)
 
 ### CRITICAL — iPad/iOS native app blocker (high confidence)
@@ -813,7 +883,53 @@ this same `if` ([line 563](MediaBrowser.Controller/SyncPlay/GroupStates/WaitingG
 findings are the two halves of one branch; fixing either alone leaves the resume-delay
 computation half-wrong.
 
-**22. No timeout on `Waiting` — a silent participant holds the group indefinitely**
+**22. No timeout on `Waiting` — a silent participant holds the group indefinitely — ✅ FIXED**
+
+> **Status:** Fixed 2026-09-05, and promoted from safety net to *primary* fix. The 2026-09-05
+> incident showed this is not the rare wedged-player case it was filed as: with finding #24, the
+> stock web client reports nothing at all after an in-buffer seek, so this deadline is the only
+> thing that makes scrubbing work.
+>
+> `Group` now owns a `CancellationTokenSource` behind
+> `IGroupStateContext.ScheduleStateTimeout` / `CancelStateTimeout`, and raises
+> `IGroupState.OnStateTimeout` when it elapses. `SetState` drops any pending deadline — every
+> transition invalidates it — and `WaitingGroupState` re-arms at the tail of each handler that
+> leaves the group waiting, so a `Waiting → Waiting` request (a second scrub, which does not call
+> `SetState`) is covered too.
+>
+> **The lifecycle concerns this finding listed are addressed as it asked.** Locking stays in
+> `SyncPlayManager`: `Group` fires a `StateTimeoutHandler` callback, the manager takes
+> `lock (group)` exactly as the request path does, and calls back into
+> `Group.HandleStateTimeout`, which drops the deadline if the state changed, the group emptied or
+> the group was disposed. `Group` is now `IDisposable` and is disposed where empty groups are
+> removed and in `SyncPlayManager.Dispose`.
+>
+> **Two tiers, because the two ways into `Waiting` behave differently.** A seek leaves the item
+> loaded, so a client that is going to answer answers at once: 2 s. Everything else — a new item,
+> a join, a real buffering stall — legitimately takes seconds and *does* get answered on this
+> deployment (the 05:52:22 `Play` took 5.4 s to produce its first `Ready`): 30 s, matching the
+> client's own `WaitForEventDefaultTimeout` so the group outlives the client's give-up rather than
+> racing it. Any `Buffer` or `Ready` during a cycle relaxes the short tier to the long one, so the
+> 2 s bound only ever fires on total silence — which is never a legitimately buffering group.
+>
+> On expiry the group does automatically what a participant does by hand: `SetAllBuffering(false)`
+> then resume, via `PlayingGroupState.HandleRequest(UnpauseGroupRequest)` so the `Unpause` carries
+> `PositionTicks` and re-seeks anyone who had not landed. Deliberately **not** through
+> `WaitingGroupState`'s own unpause handler, which sets `IgnoreBuffering` and would swallow real
+> buffering reports until the next state change. When `ResumePlaying` is false it settles into
+> `PausedGroupState`, re-dating `LastActivity` first so the wait is not folded into `PositionTicks`
+> as if it had been playing.
+>
+> Unit tests: `HandleRequest_Seek_ArmsShortWaitTimeout`,
+> `HandleRequest_Seek_AfterASessionReported_ArmsLongWaitTimeout`,
+> `SessionJoined_ArmsLongWaitTimeout`, `OnStateTimeout_ResumePlaying_ResumesGroupAtTheSeekTarget`,
+> `OnStateTimeout_ResumePlaying_DoesNotSuppressLaterBufferingReports`,
+> `OnStateTimeout_NotResumePlaying_PausesGroupWithoutAdvancingPosition`,
+> `OnStateTimeout_GroupAlreadyReady_DoesNothing`; plus
+> `tests/Jellyfin.Server.Implementations.Tests/SyncPlay/GroupStateTimeoutTests.cs` for the timer
+> plumbing itself, which the state-machine fake never runs (callback identity, cancellation on
+> `SetState` / `CancelStateTimeout` / `Dispose`, and rescheduling firing once). All 34 SyncPlay
+> tests pass. Awaiting live smoke test.
 
 Nothing re-requests `Ready` and nothing gives up on the group as a whole, so a client
 that simply never answers strands everyone. `Unpause` is the only exit
@@ -837,20 +953,39 @@ and it requires a human to press it.
 The same shape appears at 06:16:10–06:16:21, where 43e35c18 took a corrective Seek and
 never reported again; the group sat in `Waiting` for 11 s until a manual Unpause.
 
-**Deliberately scoped out of the immediate fix.** #19–#21 explain every *desync* the
-logs show, and they are cheap, local changes. A `Waiting` timeout is the safety net for
-a client that goes silent for unrelated reasons (a stalled transcode, a wedged player) —
-worth having, but it needs a per-group timer in `Group`/`SyncPlayManager` with real
-lifecycle concerns: it must take the group lock the state machine already relies on
-([SyncPlayManager.cs:376](Emby.Server.Implementations/SyncPlay/SyncPlayManager.cs#L376)),
-be cancelled on every state transition, and be disposed with the group. Track it
-separately.
+**Originally scoped out, and that call was wrong.** The reasoning was that #19–#21 explain
+every *desync* the logs show, and that a `Waiting` timeout is only the safety net for a
+client that goes silent for unrelated reasons (a stalled transcode, a wedged player). The
+2026-09-05 incident disproved the premise: going silent after a seek is not an unrelated
+edge case, it is what the stock web client does every time (#24). The deferral cost one
+more session of the same symptom.
 
 **Reproduce (definitive):** two clients in a group, playing. Kill client B's player
 process (leaving the WebSocket up, so #15's grace period does not apply) and then seek
 from client A. The group enters `Waiting` and never leaves it.
 
-**23. Behind-the-group sessions are only bounded when they are the last one ready**
+**23. Behind-the-group sessions are only bounded when they are the last one ready — ✅ FIXED**
+
+> **Status:** Fixed 2026-09-05, as suggested. The `context.IsBuffering()` branch now mirrors
+> #21's guard: a session more than `MaxPlaybackOffset` behind the group is corrected with a Seek
+> under the shared `RegisterCorrectionAttempt` budget instead of having its pause scheduled
+> arbitrarily far ahead, and after 5 corrections it is paused in place (`delayTicks = 0`) rather
+> than looped on. The last unbounded quadrant of the table below is closed.
+>
+> **The live trigger this finding said it lacked turned up.** `log_20260905.log`, on the `Play`
+> path while the other participant was still buffering:
+> `05:52:28.094  Session "ecd9d856…" will pause when ready in 928.9321588 seconds.`
+>
+> The caveat about narrowing the upstream design still holds and is respected: sub-tolerance lag
+> keeps the "pause when ready in N seconds" behaviour untouched. Only the beyond-tolerance case —
+> where the session is not lagging but in the wrong place — is rerouted. The pre-existing test
+> `HandleRequest_Ready_BehindGroup_SchedulesFuturePause` encoded the unbounded behaviour with a
+> 5-second lag; it is now `HandleRequest_Ready_BehindGroupWithinTolerance_SchedulesFuturePause`
+> with a 300 ms lag, which is what that path is for. New tests:
+> `HandleRequest_Ready_BehindGroupWhileOthersBuffering_SendsSeekCorrection` and
+> `…_StopsCorrectingAfterMaxAttempts` (asserts the give-up pause is dated now, not minutes out).
+>
+> The `IgnoreGroupWait` interaction from #5 was **not** folded in and remains open.
 
 [WaitingGroupState.cs:545-554](MediaBrowser.Controller/SyncPlay/GroupStates/WaitingGroupState.cs#L545-L554)
 
@@ -879,10 +1014,11 @@ group resumes, every member gets an `Unpause` carrying `context.PositionTicks`
 re-seeks it. The exposure is bounded by however long the group stays in `Waiting` —
 seconds in the normal case, and only unbounded if #22 also bites.
 
-**No live trigger observed.** Every large offset in the 2026-08-23 and 2026-08-29 logs
-was either ahead of the group (`is ahead of group … by 183.3506592 seconds`) or belonged
-to the last-ready session (`will resume in 2106.9428685 seconds`). This is a structural
-gap found by reading the fixed code, not a reproduction — same status as finding #11.
+**No live trigger observed at the time of writing.** Every large offset in the 2026-08-23 and
+2026-08-29 logs was either ahead of the group (`is ahead of group … by 183.3506592 seconds`)
+or belonged to the last-ready session (`will resume in 2106.9428685 seconds`). This was a
+structural gap found by reading the fixed code — until 2026-09-05 supplied the reproduction,
+recorded in the status block above.
 
 **Reproduce (definitive):** three sessions in a group, playing. Seek from A. Have B
 report `Ready` with a stale position far behind the seek target *while C has not yet
@@ -896,6 +1032,68 @@ than scheduling its pause arbitrarily far ahead. **Deliberately not applied alon
 genuinely lagging by a few hundred milliseconds, and narrowing it also affects the
 `SessionJoined` and `Buffer` flows that route through this same branch. Worth doing as
 its own change, checking the `IgnoreGroupWait` interaction from #5 at the same time.
+
+**24. jellyfin-web never reports `Ready` after an in-buffer seek — client-side, and the reason #22 is not a corner case**
+
+This is the root cause of the 2026-09-05 incident, and it re-frames #22: the `Waiting`
+timeout is not a safety net for the rare wedged player, it is the **only** thing that can
+make scrubbing work with the stock web client.
+
+`WaitingGroupState.HandleRequest(SeekGroupRequest)`
+([WaitingGroupState.cs:299-332](MediaBrowser.Controller/SyncPlay/GroupStates/WaitingGroupState.cs#L299-L332))
+calls `SetAllBuffering(true)` and then has exactly one non-human exit: a `Ready` from every
+session. Upstream jellyfin-web will not supply it. `PlaybackCore.scheduleSeek`:
+
+```js
+const callback = () => {
+    this.localUnpause();
+    this.localSeek(positionTicks);
+
+    Helper.waitForEventOnce(this.manager, 'ready', Helper.WaitForEventDefaultTimeout).then(() => {
+        this.localPause();
+        this.sendBufferingRequest(false);      // <-- the only Ready on this path
+    }).catch((error) => {
+        console.error(`Timed out while waiting for 'ready' event! Seeking to ${positionTicks}.`, error);
+        this.localSeek(positionTicks);         // <-- 30 s later: re-seek, still no Ready
+    });
+};
+```
+
+`'ready'` is emitted by `PlaybackCore.onReady()`, which the player wrapper drives off the
+media element's buffering transitions. Three consequences, each matching the logs:
+
+- **A scrub while already playing, landing inside the buffered range, fires `seeking` /
+  `seeked` but never `waiting` / `playing`.** `onReady()` never runs, the promise never
+  resolves, and no `Ready` — and no `Buffering` either, since `onBuffering()` hangs off the
+  same `waiting` event. That is the total silence in the 2026-09-05 and 2026-08-29 logs.
+- **The 30 s `.catch` fires `localSeek(positionTicks)`** — re-seeking the viewer back to the
+  frozen group position without ever telling the server. `Helper.WaitForEventDefaultTimeout`
+  is 30000 ms. This is the "repeatedly pulls people back to the same spot" half of the
+  reported symptom; `clearScheduledCommand()` clears only the pending `setTimeout`, not
+  in-flight `waitForEventOnce` promises, so re-scrubbing stacks them and each one fires at
+  *its own* stale position.
+- **Pause-then-play works because `localPause()` / `localUnpause()` force real player state
+  transitions**, which do emit `'ready'`. This is a second, independent explanation for the
+  workaround, alongside the state-machine one in the 2026-08-29 root-cause section.
+
+It also explains the duplicate `Ready` bursts (×6, ×7) throughout the logs:
+`onReady()` calls `sendBufferingRequest(false)` and *then* triggers the `'ready'` event whose
+handler calls `sendBufferingRequest(false)` again.
+
+**Not fixable in this fork.** jellyfin-web ships in the `jellyfin/jellyfin:10.11.11` base
+image that [Dockerfile](Dockerfile) overlays the patched server onto; the fork builds
+`Jellyfin.Server` only. Worth filing upstream.
+
+**Mitigated server-side 2026-09-05 by #22** — the group stops staking itself on a report that
+may never arrive, and resumes on its own ~2 s after a seek. The client still never reports, and
+still re-seeks itself 30 s later if it is somehow left waiting, so the underlying defect is open.
+
+**Reproduce (definitive):** two web/desktop clients in a group, playing, with the seek
+target already buffered (scrub a few seconds ahead). Server log shows
+`switching from Playing to Waiting` and then nothing at all until someone presses play.
+In the scrubbing client's devtools console, the
+`Timed out while waiting for 'ready' event!` error appears 30 s later, and the player jumps
+back to the seek target at that moment.
 
 ---
 
@@ -977,6 +1175,57 @@ if (user is null)
 Returning without calling `context.Succeed` is what produces the 403. The existing
 `ResourceNotFoundException` throw is left alone — a non-empty id that resolves to no
 user does represent a real inconsistency, unlike the API-key case.
+
+**25. `SyncPlayManager` throws on a session with an empty user id — same 500 as #18, one layer down — ✅ FIXED**
+
+> **Status:** Fixed 2026-09-05. `JoinGroup`, `ListGroups` and `GetGroup` guard
+> `session.UserId.IsEmpty()` before the lookup and fail closed — an access-denied update, an
+> empty list, and `null` (which the controller turns into a 404) respectively.
+>
+> Unit tests: `ListGroups_SessionWithoutUser_ReturnsEmptyRatherThanThrowing`,
+> `GetGroup_SessionWithoutUser_ReturnsNullRatherThanThrowing`,
+> `JoinGroup_SessionWithoutUser_IsDeniedRatherThanThrowing` in `SyncPlayManagerTests`. These
+> take up #18's own closing suggestion — the fixture now does
+> `userManager.Setup(m => m.GetUserById(Guid.Empty)).Throws(...)`, so the real production
+> failure mode is modelled rather than an auto-mock artefact. Verified to bite: removing the
+> three guards turns exactly those three tests red. All 37 SyncPlay tests pass.
+
+**Live evidence**, `log_20260905.log`:
+
+```text
+[2026-09-05 06:40:07.024] [ERR] Jellyfin.Api.Middleware.ExceptionMiddleware:
+    Error processing request. URL "GET" "/SyncPlay/List".
+System.ArgumentException: Guid can't be empty (Parameter 'id')
+   at Jellyfin.Server.Implementations.Users.UserManager.GetUserById(Guid id)
+   at Emby.Server.Implementations.SyncPlay.SyncPlayManager.ListGroups(...) line 314
+   at Jellyfin.Api.Controllers.SyncPlayController.SyncPlayGetGroups()
+```
+
+**#18's fix could not have prevented this, and that is the point worth recording.** The two
+guards are on *different values*:
+
+| | value checked | source |
+| --- | --- | --- |
+| #18 — `SyncPlayAccessHandler` | `context.User.GetUserId()` | the authenticated principal |
+| #25 — `SyncPlayManager` | `session.UserId` | the `SessionInfo` from `RequestHelpers.GetSession` |
+
+A request can carry a principal with a real user id — so `[Authorize(Policy =
+Policies.SyncPlayJoinGroup)]` on
+[SyncPlayController.SyncPlayGetGroups](Jellyfin.Api/Controllers/SyncPlayController.cs#L104-L112)
+passes — and still resolve to a session whose `UserId` is empty. The `mcp-server` session on
+this deployment is exactly that shape (`"client":"mcp-server","user":""`), which is why the
+endpoint 500s for it while every policy check succeeds. Fixing an empty-Guid crash at the
+policy layer says nothing about the session layer.
+
+All three `_userManager.GetUserById(session.UserId)` call sites had the flaw; only `ListGroups`
+had been observed firing because it is the only one of the three that a userless session
+routinely calls.
+
+**Still open — the same shape inside `Group`.** [`AllUsersHaveAccessToQueue`](Emby.Server.Implementations/SyncPlay/Group.cs#L218-L236)
+maps participants through `_userManager.GetUserById(participant.UserId)`, so a userless member
+that gets into a group by some other route still throws when a queue is set. Not fixed here
+because failing closed there denies the *whole group's* queue change over one member, which is
+a behavioural call rather than a guard. Worth its own change.
 
 **7. No re-authorization on the WebSocket broadcast path**
 

@@ -24,7 +24,7 @@ namespace Emby.Server.Implementations.SyncPlay
     /// <remarks>
     /// Class is not thread-safe, external locking is required when accessing methods.
     /// </remarks>
-    public class Group : IGroupStateContext
+    public class Group : IGroupStateContext, IDisposable
     {
         /// <summary>
         /// The logger.
@@ -63,6 +63,16 @@ namespace Emby.Server.Implementations.SyncPlay
         private IGroupState _state;
 
         /// <summary>
+        /// The cancellation source of the pending state timeout.
+        /// </summary>
+        private CancellationTokenSource _stateTimeoutCts;
+
+        /// <summary>
+        /// Whether the group has been disposed.
+        /// </summary>
+        private bool _disposed;
+
+        /// <summary>
         /// Initializes a new instance of the <see cref="Group" /> class.
         /// </summary>
         /// <param name="loggerFactory">The logger factory.</param>
@@ -83,6 +93,16 @@ namespace Emby.Server.Implementations.SyncPlay
 
             _state = new IdleGroupState(loggerFactory);
         }
+
+        /// <summary>
+        /// Gets or sets the callback invoked when a scheduled state timeout elapses.
+        /// </summary>
+        /// <remarks>
+        /// Set by the owner, which is responsible for taking the group lock before calling
+        /// <see cref="HandleStateTimeout"/>. Locking is not done here so that the group keeps a
+        /// single locking discipline, owned by <c>SyncPlayManager</c>.
+        /// </remarks>
+        internal Action<Group, IGroupState> StateTimeoutHandler { get; set; }
 
         /// <summary>
         /// Gets the default ping value used for sessions.
@@ -395,7 +415,103 @@ namespace Emby.Server.Implementations.SyncPlay
         public void SetState(IGroupState state)
         {
             _logger.LogInformation("Group {GroupId} switching from {FromStateType} to {ToStateType}.", GroupId.ToString(), _state.Type, state.Type);
+
+            // Any pending deadline belongs to the state being replaced.
+            CancelStateTimeout();
+
             this._state = state;
+        }
+
+        /// <inheritdoc />
+        public void ScheduleStateTimeout(TimeSpan delay)
+        {
+            CancelStateTimeout();
+
+            if (_disposed)
+            {
+                return;
+            }
+
+            var cts = new CancellationTokenSource();
+            _stateTimeoutCts = cts;
+
+            // The state that schedules the deadline is the only one allowed to act on it.
+            _ = RunStateTimeout(_state, delay, cts.Token);
+        }
+
+        /// <inheritdoc />
+        public void CancelStateTimeout()
+        {
+            var cts = _stateTimeoutCts;
+            _stateTimeoutCts = null;
+
+            if (cts is not null)
+            {
+                cts.Cancel();
+                cts.Dispose();
+            }
+        }
+
+        /// <summary>
+        /// Handles the expiry of a scheduled state timeout.
+        /// </summary>
+        /// <remarks>
+        /// The caller must hold the group lock, as the state machine is not thread-safe.
+        /// </remarks>
+        /// <param name="scheduledFor">The state that scheduled the timeout.</param>
+        internal void HandleStateTimeout(IGroupState scheduledFor)
+        {
+            // The deadline lost the race against a state change or the group emptying out.
+            if (_disposed || !ReferenceEquals(_state, scheduledFor) || IsGroupEmpty())
+            {
+                return;
+            }
+
+            _state.OnStateTimeout(this, CancellationToken.None);
+        }
+
+        /// <inheritdoc />
+        public void Dispose()
+        {
+            Dispose(true);
+            GC.SuppressFinalize(this);
+        }
+
+        /// <summary>
+        /// Releases the resources used by the group.
+        /// </summary>
+        /// <param name="disposing"><c>true</c> to release both managed and unmanaged resources; <c>false</c> to release only unmanaged resources.</param>
+        protected virtual void Dispose(bool disposing)
+        {
+            if (_disposed)
+            {
+                return;
+            }
+
+            CancelStateTimeout();
+
+            _disposed = true;
+        }
+
+        private async Task RunStateTimeout(IGroupState scheduledFor, TimeSpan delay, CancellationToken cancellationToken)
+        {
+            try
+            {
+                await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                // The group moved on before the deadline elapsed.
+                return;
+            }
+
+            if (cancellationToken.IsCancellationRequested)
+            {
+                return;
+            }
+
+            // The owner takes the group lock that the request path relies on, then calls back in.
+            StateTimeoutHandler?.Invoke(this, scheduledFor);
         }
 
         /// <inheritdoc />

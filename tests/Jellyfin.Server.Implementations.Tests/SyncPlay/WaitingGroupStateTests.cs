@@ -165,18 +165,22 @@ namespace Jellyfin.Server.Implementations.Tests.SyncPlay
         }
 
         [Fact]
-        public void HandleRequest_Ready_BehindGroup_SchedulesFuturePause()
+        public void HandleRequest_Ready_BehindGroupWithinTolerance_SchedulesFuturePause()
         {
             _state.ResumePlaying = true;
-            _context.PositionTicks = TimeSpan.FromSeconds(10).Ticks;
+            _context.PositionTicks = TimeSpan.FromMilliseconds(10300).Ticks;
 
             var before = DateTime.UtcNow;
-            HandleReady(ReadyRequest(TimeSpan.FromSeconds(5).Ticks, isPlaying: true));
+            HandleReady(ReadyRequest(TimeSpan.FromSeconds(10).Ticks, isPlaying: true));
             var after = DateTime.UtcNow;
 
+            // "Pause when ready in N seconds" is the upstream design for a client lagging by a
+            // few hundred milliseconds. Past the tolerance it is corrected instead — see
+            // HandleRequest_Ready_BehindGroupWhileOthersBuffering_SendsSeekCorrection.
             var command = Assert.Single(_context.Commands);
             Assert.Equal(SendCommandType.Pause, command.Command);
-            Assert.InRange(command.When, before.AddSeconds(4), after.AddSeconds(6));
+            Assert.InRange(command.When, before.AddMilliseconds(200), after.AddMilliseconds(400));
+            Assert.False(_context.IsBuffering(_session.Id));
         }
 
         [Fact]
@@ -361,6 +365,148 @@ namespace Jellyfin.Server.Implementations.Tests.SyncPlay
             Assert.True(_context.IsBuffering(_session.Id));
         }
 
+        private void HandleSeek(long positionTicks, GroupStateType prevState)
+        {
+            _state.HandleRequest(new SeekGroupRequest(positionTicks), _context, prevState, _session, CancellationToken.None);
+        }
+
+        [Fact]
+        public void HandleRequest_Seek_ArmsShortWaitTimeout()
+        {
+            // A seek leaves the item loaded, so a client that is going to answer answers at
+            // once. The stock web client answers not at all when the seek lands inside the
+            // buffered range, and the group must not wait on it forever.
+            HandleSeek(TimeSpan.FromSeconds(30).Ticks, GroupStateType.Playing);
+
+            Assert.Equal(TimeSpan.FromSeconds(2), _context.LastScheduledTimeout);
+        }
+
+        [Fact]
+        public void HandleRequest_Seek_AfterASessionReported_ArmsLongWaitTimeout()
+        {
+            HandleSeek(TimeSpan.FromSeconds(30).Ticks, GroupStateType.Playing);
+            _state.ResumePlaying = true;
+
+            // A session that reports is a session that is genuinely working through the seek,
+            // so the group goes back to giving it the full allowance.
+            HandleReady(ReadyRequest(_context.PositionTicks, isPlaying: true));
+
+            Assert.Equal(TimeSpan.FromSeconds(30), _context.LastScheduledTimeout);
+        }
+
+        [Fact]
+        public void SessionJoined_ArmsLongWaitTimeout()
+        {
+            // Loading an item legitimately takes seconds, and clients do report Ready on this
+            // path, so it keeps the full allowance rather than the seek deadline.
+            _state.SessionJoined(_context, GroupStateType.Playing, _session, CancellationToken.None);
+
+            Assert.Equal(TimeSpan.FromSeconds(30), _context.LastScheduledTimeout);
+        }
+
+        [Fact]
+        public void OnStateTimeout_ResumePlaying_ResumesGroupAtTheSeekTarget()
+        {
+            HandleSeek(TimeSpan.FromSeconds(30).Ticks, GroupStateType.Playing);
+            _context.Commands.Clear();
+
+            var before = DateTime.UtcNow;
+            _state.OnStateTimeout(_context, CancellationToken.None);
+
+            // The automatic equivalent of a participant pressing play to escape the wait.
+            Assert.IsType<PlayingGroupState>(_context.State);
+            Assert.False(_context.IsBuffering());
+
+            var command = Assert.Single(_context.Commands);
+            Assert.Equal(SendCommandType.Unpause, command.Command);
+            Assert.Equal(TimeSpan.FromSeconds(30).Ticks, command.PositionTicks);
+            Assert.True(command.When >= before);
+        }
+
+        [Fact]
+        public void OnStateTimeout_ResumePlaying_DoesNotSuppressLaterBufferingReports()
+        {
+            HandleSeek(TimeSpan.FromSeconds(30).Ticks, GroupStateType.Playing);
+            _state.OnStateTimeout(_context, CancellationToken.None);
+
+            // The manual Unpause escape sets IgnoreBuffering, which swallows every Buffer
+            // request until the next state change. The automatic one must not.
+            var playingState = Assert.IsType<PlayingGroupState>(_context.State);
+            Assert.False(playingState.IgnoreBuffering);
+        }
+
+        [Fact]
+        public void OnStateTimeout_NotResumePlaying_PausesGroupWithoutAdvancingPosition()
+        {
+            HandleSeek(TimeSpan.FromSeconds(30).Ticks, GroupStateType.Paused);
+            _context.Commands.Clear();
+
+            // The group sat in the waiting state for a while: LastActivity is stale.
+            _context.LastActivity = DateTime.UtcNow.AddSeconds(-30);
+            var positionTicks = _context.PositionTicks;
+
+            _state.OnStateTimeout(_context, CancellationToken.None);
+
+            Assert.IsType<PausedGroupState>(_context.State);
+            Assert.False(_context.IsBuffering());
+
+            // Nobody was playing during the wait, so none of it belongs in the position.
+            Assert.InRange(_context.PositionTicks, positionTicks, positionTicks + TimeSpan.FromSeconds(1).Ticks);
+
+            var command = Assert.Single(_context.Commands);
+            Assert.Equal(SendCommandType.Pause, command.Command);
+        }
+
+        [Fact]
+        public void OnStateTimeout_GroupAlreadyReady_DoesNothing()
+        {
+            HandleSeek(TimeSpan.FromSeconds(30).Ticks, GroupStateType.Playing);
+            _context.SetAllBuffering(false);
+            _context.Commands.Clear();
+
+            // A deadline that lost the race against the group converging is inert.
+            _state.OnStateTimeout(_context, CancellationToken.None);
+
+            Assert.Null(_context.State);
+            Assert.Empty(_context.Commands);
+        }
+
+        [Fact]
+        public void HandleRequest_Ready_BehindGroupWhileOthersBuffering_SendsSeekCorrection()
+        {
+            _state.ResumePlaying = true;
+            _context.PositionTicks = TimeSpan.FromSeconds(100).Ticks;
+
+            HandleReady(ReadyRequest(0, isPlaying: true));
+
+            // Past the tolerance the session is not lagging, it is in the wrong place, and
+            // "pause when ready in 100 seconds" means it never pauses at all.
+            var command = Assert.Single(_context.Commands);
+            Assert.Equal(SendCommandType.Seek, command.Command);
+            Assert.True(_context.IsBuffering(_session.Id));
+        }
+
+        [Fact]
+        public void HandleRequest_Ready_BehindGroupWhileOthersBuffering_StopsCorrectingAfterMaxAttempts()
+        {
+            _state.ResumePlaying = true;
+            _context.PositionTicks = TimeSpan.FromSeconds(100).Ticks;
+
+            var before = DateTime.UtcNow;
+            for (var i = 0; i < 6; i++)
+            {
+                HandleReady(ReadyRequest(0, isPlaying: true));
+            }
+
+            var after = DateTime.UtcNow;
+
+            Assert.Equal(5, _context.Commands.Count(c => c.Command == SendCommandType.Seek));
+
+            // The give-up pauses it in place rather than minutes out.
+            var pause = Assert.Single(_context.Commands, c => c.Command == SendCommandType.Pause);
+            Assert.InRange(pause.When, before, after);
+        }
+
         private sealed class FakeGroupStateContext : IGroupStateContext
         {
             private readonly Dictionary<string, bool> _buffering = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
@@ -393,6 +539,13 @@ namespace Jellyfin.Server.Implementations.Tests.SyncPlay
             public Guid PlaylistItemId { get; }
 
             public List<SendCommand> Commands { get; } = new List<SendCommand>();
+
+            public List<TimeSpan> ScheduledTimeouts { get; } = new List<TimeSpan>();
+
+            public int CancelledTimeouts { get; private set; }
+
+            public TimeSpan? LastScheduledTimeout =>
+                ScheduledTimeouts.Count == 0 ? null : ScheduledTimeouts[^1];
 
             public bool IsBuffering(string sessionId)
             {
@@ -439,7 +592,18 @@ namespace Jellyfin.Server.Implementations.Tests.SyncPlay
 
             public void SetState(IGroupState state)
             {
+                CancelStateTimeout();
                 State = state;
+            }
+
+            public void ScheduleStateTimeout(TimeSpan delay)
+            {
+                ScheduledTimeouts.Add(delay);
+            }
+
+            public void CancelStateTimeout()
+            {
+                CancelledTimeouts++;
             }
 
             public void UpdatePing(SessionInfo session, long ping)

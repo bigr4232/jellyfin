@@ -5,6 +5,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
+using Jellyfin.Extensions;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.Session;
 using MediaBrowser.Controller.SyncPlay;
@@ -135,6 +136,13 @@ namespace Emby.Server.Implementations.SyncPlay
 
             _pendingLeaves.Clear();
 
+            foreach (var group in _groups.Values)
+            {
+                group.Dispose();
+            }
+
+            _groups.Clear();
+
             _disposed = true;
         }
 
@@ -161,7 +169,11 @@ namespace Emby.Server.Implementations.SyncPlay
                     LeaveGroup(session, leaveGroupRequest, cancellationToken);
                 }
 
-                var group = new Group(_loggerFactory, _userManager, _sessionManager, _libraryManager);
+                var group = new Group(_loggerFactory, _userManager, _sessionManager, _libraryManager)
+                {
+                    StateTimeoutHandler = OnGroupStateTimeout
+                };
+
                 _groups[group.GroupId] = group;
 
                 if (!_sessionToGroupMap.TryAdd(session.Id, group))
@@ -186,6 +198,15 @@ namespace Emby.Server.Implementations.SyncPlay
             if (request is null)
             {
                 throw new InvalidOperationException("Request is null!");
+            }
+
+            if (session.UserId.IsEmpty())
+            {
+                _logger.LogWarning("Session {SessionId} tried to join group {GroupId} without a user.", session.Id, request.GroupId);
+
+                var noUserError = new SyncPlayLibraryAccessDeniedUpdate(request.GroupId, string.Empty);
+                _sessionManager.SendSyncPlayGroupUpdate(session.Id, noUserError, CancellationToken.None);
+                return;
             }
 
             var user = _userManager.GetUserById(session.UserId);
@@ -287,6 +308,9 @@ namespace Emby.Server.Implementations.SyncPlay
                         {
                             _logger.LogInformation("Group {GroupId} is empty, removing it.", group.GroupId);
                             _groups.Remove(group.GroupId, out _);
+
+                            // The group owns the cancellation source of its state timeout.
+                            group.Dispose();
                         }
                     }
                 }
@@ -311,6 +335,12 @@ namespace Emby.Server.Implementations.SyncPlay
             if (request is null)
             {
                 throw new InvalidOperationException("Request is null!");
+            }
+
+            if (session.UserId.IsEmpty())
+            {
+                // A session with no user can access no group's queue.
+                return new List<GroupInfoDto>();
             }
 
             var user = _userManager.GetUserById(session.UserId);
@@ -338,6 +368,12 @@ namespace Emby.Server.Implementations.SyncPlay
         public GroupInfoDto GetGroup(SessionInfo session, Guid groupId)
         {
             ArgumentNullException.ThrowIfNull(session);
+
+            if (session.UserId.IsEmpty())
+            {
+                // A session with no user can access no group's queue.
+                return null;
+            }
 
             var user = _userManager.GetUserById(session.UserId);
 
@@ -415,6 +451,22 @@ namespace Emby.Server.Implementations.SyncPlay
             }
 
             return false;
+        }
+
+        private void OnGroupStateTimeout(Group group, IGroupState scheduledFor)
+        {
+            try
+            {
+                // Group lock required as Group is not thread-safe, same as the request path.
+                lock (group)
+                {
+                    group.HandleStateTimeout(scheduledFor);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Error handling the state timeout of group {GroupId}.", group.GroupId);
+            }
         }
 
         private void OnSessionEnded(object sender, SessionEventArgs e)

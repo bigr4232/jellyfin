@@ -24,6 +24,27 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
         private const int MaxCorrectionAttempts = 5;
 
         /// <summary>
+        /// How long the group waits for Ready reports after a seek before proceeding without them.
+        /// </summary>
+        /// <remarks>
+        /// A seek leaves the item loaded, so a client that is going to answer answers at once.
+        /// The stock web client does not answer at all when the seek lands inside the buffered
+        /// range: its player never fires the event that its Ready report hangs off, so nothing is
+        /// sent and the group would wait forever. See finding #24 in syncplay-code-review.md.
+        /// </remarks>
+        private static readonly TimeSpan SeekWaitTimeout = TimeSpan.FromSeconds(2);
+
+        /// <summary>
+        /// How long the group waits for Ready reports in every other case.
+        /// </summary>
+        /// <remarks>
+        /// Loading a new item, joining, or recovering from a real buffering stall legitimately
+        /// takes seconds. This matches the web client's own WaitForEventDefaultTimeout, so the
+        /// group outlives the client's internal give-up rather than racing it.
+        /// </remarks>
+        private static readonly TimeSpan WaitTimeout = TimeSpan.FromSeconds(30);
+
+        /// <summary>
         /// The logger.
         /// </summary>
         private readonly ILogger<WaitingGroupState> _logger;
@@ -32,6 +53,25 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
         /// Number of corrective seeks issued per session during this waiting cycle.
         /// </summary>
         private readonly Dictionary<string, int> _correctionAttempts = new();
+
+        /// <summary>
+        /// A session of this group, used as the sender when the wait times out.
+        /// </summary>
+        /// <remarks>
+        /// The resume and pause broadcasts go to the whole group, which ignores the sender, so
+        /// any participant will do; this just keeps a real one on hand.
+        /// </remarks>
+        private SessionInfo _waitingSession;
+
+        /// <summary>
+        /// Whether this waiting cycle was started by a seek, leaving the item already loaded.
+        /// </summary>
+        private bool _startedBySeek;
+
+        /// <summary>
+        /// Whether any session has reported buffering or readiness during this waiting cycle.
+        /// </summary>
+        private bool _sessionReported;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="WaitingGroupState"/> class.
@@ -97,6 +137,8 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
             // Send pause command to all non-buffering sessions.
             var command = context.NewSyncPlayCommand(SendCommandType.Pause);
             context.SendCommand(session, SyncPlayBroadcastType.AllReady, command, cancellationToken);
+
+            ArmWaitTimeout(context, session);
         }
 
         /// <inheritdoc />
@@ -131,6 +173,14 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
                     var pausedState = new PausedGroupState(LoggerFactory);
                     context.SetState(pausedState);
                 }
+            }
+            else
+            {
+                // Still waiting on someone else. The departing session is not offered as the
+                // deadline sender: the timeout broadcasts to the whole group, which resolves its
+                // own recipients, so a session that is on its way out would do no harm but adds
+                // nothing either.
+                ArmWaitTimeout(context, null);
             }
         }
 
@@ -170,6 +220,8 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
             // Reset status of sessions and await for all Ready events.
             context.SetAllBuffering(true);
 
+            ArmWaitTimeout(context, session);
+
             _logger.LogDebug("Session {SessionId} set a new play queue in group {GroupId}.", session.Id, context.GroupId.ToString());
         }
 
@@ -194,6 +246,8 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
 
                 // Reset status of sessions and await for all Ready events.
                 context.SetAllBuffering(true);
+
+                ArmWaitTimeout(context, session);
             }
             else
             {
@@ -233,6 +287,8 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
                 // Reset status of sessions and await for all Ready events.
                 context.SetAllBuffering(true);
 
+                ArmWaitTimeout(context, session);
+
                 _logger.LogDebug("Group {GroupId} is waiting for all ready events.", context.GroupId.ToString());
             }
             else
@@ -259,6 +315,8 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
 
                     // Notify relevant state change event.
                     SendGroupStateUpdate(context, request, session, cancellationToken);
+
+                    ArmWaitTimeout(context, session);
                 }
             }
         }
@@ -278,6 +336,8 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
 
             // Notify relevant state change event.
             SendGroupStateUpdate(context, request, session, cancellationToken);
+
+            ArmWaitTimeout(context, session);
         }
 
         /// <inheritdoc />
@@ -309,10 +369,16 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
             if (prevState.Equals(GroupStateType.Playing))
             {
                 ResumePlaying = true;
+
+                // This seek is what put the group into the waiting state, so the item is already
+                // loaded and the short deadline applies. A seek arriving while the group is
+                // already waiting leaves the flag as the cycle set it.
+                _startedBySeek = true;
             }
             else if (prevState.Equals(GroupStateType.Paused))
             {
                 ResumePlaying = false;
+                _startedBySeek = true;
             }
 
             // Sanitize PositionTicks.
@@ -330,6 +396,8 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
 
             // Notify relevant state change event.
             SendGroupStateUpdate(context, request, session, cancellationToken);
+
+            ArmWaitTimeout(context, session);
         }
 
         /// <inheritdoc />
@@ -342,6 +410,10 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
                 InitialStateSet = true;
             }
 
+            // A session reporting anything means the group is not waiting on a client that
+            // has silently finished, so the short seek deadline no longer applies.
+            _sessionReported = true;
+
             // Make sure the client is playing the correct item.
             if (!request.PlaylistItemId.Equals(context.PlayQueue.GetPlayingItemPlaylistId()))
             {
@@ -351,6 +423,8 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
                 var updateSession = new SyncPlayPlayQueueUpdate(context.GroupId, playQueueUpdate);
                 context.SendGroupUpdate(session, SyncPlayBroadcastType.CurrentSession, updateSession, cancellationToken);
                 context.SetBuffering(session, true);
+
+                ArmWaitTimeout(context, session);
 
                 return;
             }
@@ -404,6 +478,8 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
 
             // Notify relevant state change event.
             SendGroupStateUpdate(context, request, session, cancellationToken);
+
+            ArmWaitTimeout(context, session);
         }
 
         /// <inheritdoc />
@@ -416,6 +492,8 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
                 InitialStateSet = true;
             }
 
+            _sessionReported = true;
+
             // Make sure the client is playing the correct item.
             if (!request.PlaylistItemId.Equals(context.PlayQueue.GetPlayingItemPlaylistId()))
             {
@@ -425,6 +503,8 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
                 var update = new SyncPlayPlayQueueUpdate(context.GroupId, playQueueUpdate);
                 context.SendGroupUpdate(session, SyncPlayBroadcastType.CurrentSession, update, cancellationToken);
                 context.SetBuffering(session, true);
+
+                ArmWaitTimeout(context, session);
 
                 return;
             }
@@ -476,6 +556,8 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
                         // Notify relevant state change event.
                         SendGroupStateUpdate(context, request, session, cancellationToken);
 
+                        ArmWaitTimeout(context, session);
+
                         _logger.LogWarning("Session {SessionId} got lost in time, correcting.", session.Id);
                         return;
                     }
@@ -525,6 +607,8 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
                             // Notify relevant state change event.
                             SendGroupStateUpdate(context, request, session, cancellationToken);
 
+                            ArmWaitTimeout(context, session);
+
                             _logger.LogWarning("Session {SessionId} is ahead of group {GroupId} by {Delay} seconds, correcting.", session.Id, context.GroupId.ToString(), TimeSpan.FromTicks(-delayTicks).TotalSeconds);
                             return;
                         }
@@ -542,6 +626,41 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
 
                         delayTicks = 0;
                     }
+                    else if (delayTicks > maxPlaybackOffsetTicks)
+                    {
+                        // Behind the group by more than the tolerance while someone else is still
+                        // buffering. "Pause when ready in N seconds" is the upstream design for a
+                        // client lagging by a few hundred milliseconds; past that the session is
+                        // not lagging, it is in the wrong place, and scheduling its pause that far
+                        // out means it never pauses at all. Correct it under the shared budget,
+                        // the same way the last-one-ready branch below does.
+                        var attempts = RegisterCorrectionAttempt(session.Id);
+                        if (attempts <= MaxCorrectionAttempts)
+                        {
+                            context.SetBuffering(session, true);
+
+                            var seek = context.NewSyncPlayCommand(SendCommandType.Seek);
+                            context.SendCommand(session, SyncPlayBroadcastType.CurrentSession, seek, cancellationToken);
+
+                            // Notify relevant state change event.
+                            SendGroupStateUpdate(context, request, session, cancellationToken);
+
+                            ArmWaitTimeout(context, session);
+
+                            _logger.LogWarning("Session {SessionId} is behind group {GroupId} by {Delay} seconds while others buffer, correcting.", session.Id, context.GroupId.ToString(), TimeSpan.FromTicks(delayTicks).TotalSeconds);
+                            return;
+                        }
+
+                        // The client cannot reach the group position. Stop correcting and pause it
+                        // where it is, so it stops drifting further behind while the group waits.
+                        _logger.LogWarning(
+                            "Session {SessionId} is still behind group {GroupId} after {Attempts} corrections; pausing it in place.",
+                            session.Id,
+                            context.GroupId.ToString(),
+                            attempts);
+
+                        delayTicks = 0;
+                    }
 
                     // Clamp sub-tolerance jitter so the pause is never dated in
                     // the past, which the client would fire immediately.
@@ -551,6 +670,8 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
                     var command = context.NewSyncPlayCommand(SendCommandType.Pause);
                     command.When = currentTime.AddTicks(delayTicks);
                     context.SendCommand(session, SyncPlayBroadcastType.CurrentSession, command, cancellationToken);
+
+                    ArmWaitTimeout(context, session);
 
                     _logger.LogInformation("Session {SessionId} will pause when ready in {Delay} seconds. Group {GroupId} is waiting for all ready events.", session.Id, TimeSpan.FromTicks(delayTicks).TotalSeconds, context.GroupId.ToString());
                 }
@@ -576,6 +697,8 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
 
                             // Notify relevant state change event.
                             SendGroupStateUpdate(context, request, session, cancellationToken);
+
+                            ArmWaitTimeout(context, session);
 
                             _logger.LogWarning("Session {SessionId} is behind group {GroupId} by {Delay} seconds, correcting.", session.Id, context.GroupId.ToString(), TimeSpan.FromTicks(delayTicks).TotalSeconds);
                             return;
@@ -647,6 +770,8 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
                         // Notify relevant state change event.
                         SendGroupStateUpdate(context, request, session, cancellationToken);
 
+                        ArmWaitTimeout(context, session);
+
                         _logger.LogWarning("Session {SessionId} is seeking to wrong position, correcting.", session.Id);
                         return;
                     }
@@ -690,6 +815,10 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
                         pausedState.HandleRequest(request, context, Type, session, cancellationToken);
                     }
                 }
+                else
+                {
+                    ArmWaitTimeout(context, session);
+                }
             }
         }
 
@@ -722,6 +851,8 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
 
                 // Reset status of sessions and await for all Ready events.
                 context.SetAllBuffering(true);
+
+                ArmWaitTimeout(context, session);
             }
             else
             {
@@ -768,6 +899,8 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
 
                 // Reset status of sessions and await for all Ready events.
                 context.SetAllBuffering(true);
+
+                ArmWaitTimeout(context, session);
             }
             else
             {
@@ -809,6 +942,71 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
                     context.SetState(pausedState);
                 }
             }
+            else
+            {
+                ArmWaitTimeout(context, session);
+            }
+        }
+
+        /// <inheritdoc />
+        public override void OnStateTimeout(IGroupStateContext context, CancellationToken cancellationToken)
+        {
+            if (!context.IsBuffering())
+            {
+                // The group converged between the deadline elapsing and this running.
+                return;
+            }
+
+            if (_waitingSession is null)
+            {
+                // Nothing to broadcast from. Cannot happen in practice: every path that arms the
+                // deadline passes a session, and the one that does not runs after those.
+                _logger.LogWarning("Group {GroupId} timed out waiting with no known session.", context.GroupId.ToString());
+                return;
+            }
+
+            _logger.LogWarning(
+                "Group {GroupId} timed out waiting for Ready reports; proceeding without the sessions that did not answer.",
+                context.GroupId.ToString());
+
+            context.SetAllBuffering(false);
+
+            // This is the automatic equivalent of a participant pressing play to escape the wait,
+            // minus the IgnoreBuffering flag that the manual Unpause path sets: real buffering
+            // reports must keep working after the group resumes.
+            if (ResumePlaying)
+            {
+                var playingState = new PlayingGroupState(LoggerFactory);
+                context.SetState(playingState);
+                playingState.HandleRequest(new UnpauseGroupRequest(), context, Type, _waitingSession, cancellationToken);
+            }
+            else
+            {
+                // LastActivity is still dated at the start of the waiting cycle, and the paused
+                // state folds the time since into PositionTicks as if it had been playing.
+                context.LastActivity = DateTime.UtcNow;
+
+                var pausedState = new PausedGroupState(LoggerFactory);
+                context.SetState(pausedState);
+                pausedState.HandleRequest(new PauseGroupRequest(), context, Type, _waitingSession, cancellationToken);
+            }
+        }
+
+        /// <summary>
+        /// Schedules the deadline by which this waiting cycle gives up on the sessions that have
+        /// not reported, replacing any deadline already pending.
+        /// </summary>
+        /// <param name="context">The context of the state.</param>
+        /// <param name="session">A live session of the group, or <c>null</c> to keep the current one.</param>
+        private void ArmWaitTimeout(IGroupStateContext context, SessionInfo session)
+        {
+            if (session is not null)
+            {
+                _waitingSession = session;
+            }
+
+            var timeout = _startedBySeek && !_sessionReported ? SeekWaitTimeout : WaitTimeout;
+            context.ScheduleStateTimeout(timeout);
         }
 
         /// <summary>

@@ -37,6 +37,17 @@ namespace MediaBrowser.Controller.SyncPlay
         void SessionLeaving(IGroupStateContext context, GroupStateType prevState, SessionInfo session, CancellationToken cancellationToken);
 
         /// <summary>
+        /// Handles the expiry of the timeout scheduled by this state.
+        /// </summary>
+        /// <remarks>
+        /// Only raised for the state instance that scheduled the timeout, and only while that
+        /// instance is still the group's current state. Context's state can change.
+        /// </remarks>
+        /// <param name="context">The context of the state.</param>
+        /// <param name="cancellationToken">The cancellation token.</param>
+        void OnStateTimeout(IGroupStateContext context, CancellationToken cancellationToken);
+
+        /// <summary>
         /// Generic handler. Context's state can change.
         /// </summary>
         /// <param name="request">The generic request.</param>

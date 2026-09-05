@@ -46,6 +46,12 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
         public abstract void SessionLeaving(IGroupStateContext context, GroupStateType prevState, SessionInfo session, CancellationToken cancellationToken);
 
         /// <inheritdoc />
+        public virtual void OnStateTimeout(IGroupStateContext context, CancellationToken cancellationToken)
+        {
+            // Only the waiting state has a deadline; every other state is stable by itself.
+        }
+
+        /// <inheritdoc />
         public virtual void HandleRequest(IGroupPlaybackRequest request, IGroupStateContext context, GroupStateType prevState, SessionInfo session, CancellationToken cancellationToken)
         {
             UnhandledRequest(request);
