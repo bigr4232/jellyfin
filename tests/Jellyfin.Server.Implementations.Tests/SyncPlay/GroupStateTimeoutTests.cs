@@ -69,7 +69,7 @@ namespace Jellyfin.Server.Implementations.Tests.SyncPlay
             _group.SetState(currentState);
             _group.ScheduleStateTimeout(TestDelay);
 
-            await fired.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            await fired.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
 
             // The deadline belongs to the state that armed it, so the owner can drop it if the
             // group has moved on by the time the lock is taken.
@@ -85,7 +85,7 @@ namespace Jellyfin.Server.Implementations.Tests.SyncPlay
             _group.ScheduleStateTimeout(TestDelay);
             _group.SetState(new PausedGroupState(_loggerFactory));
 
-            await Task.Delay(TestDelay * 6);
+            await Task.Delay(TestDelay * 6, TestContext.Current.CancellationToken);
 
             Assert.False(fired);
         }
@@ -99,7 +99,7 @@ namespace Jellyfin.Server.Implementations.Tests.SyncPlay
             _group.ScheduleStateTimeout(TestDelay);
             _group.CancelStateTimeout();
 
-            await Task.Delay(TestDelay * 6);
+            await Task.Delay(TestDelay * 6, TestContext.Current.CancellationToken);
 
             Assert.False(fired);
         }
@@ -114,7 +114,7 @@ namespace Jellyfin.Server.Implementations.Tests.SyncPlay
             _group.ScheduleStateTimeout(TestDelay);
             _group.ScheduleStateTimeout(TestDelay);
 
-            await Task.Delay(TestDelay * 6);
+            await Task.Delay(TestDelay * 6, TestContext.Current.CancellationToken);
 
             Assert.Equal(1, Volatile.Read(ref fired));
         }
@@ -128,7 +128,7 @@ namespace Jellyfin.Server.Implementations.Tests.SyncPlay
             _group.ScheduleStateTimeout(TestDelay);
             _group.Dispose();
 
-            await Task.Delay(TestDelay * 6);
+            await Task.Delay(TestDelay * 6, TestContext.Current.CancellationToken);
 
             Assert.False(fired);
         }

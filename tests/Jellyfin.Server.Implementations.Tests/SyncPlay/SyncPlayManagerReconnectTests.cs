@@ -73,7 +73,7 @@ public class SyncPlayManagerReconnectTests : IDisposable
 
         RaiseSessionEnded();
 
-        await Task.Delay(_testGracePeriod * 5);
+        await Task.Delay(_testGracePeriod * 5, TestContext.Current.CancellationToken);
 
         Assert.False(_syncPlayManager.IsUserActive(_userId));
         Assert.Empty(_syncPlayManager.ListGroups(_session, new ListGroupsRequest()));
@@ -87,7 +87,7 @@ public class SyncPlayManagerReconnectTests : IDisposable
         RaiseSessionEnded();
         RaiseSessionControllerConnected();
 
-        await Task.Delay(_testGracePeriod * 5);
+        await Task.Delay(_testGracePeriod * 5, TestContext.Current.CancellationToken);
 
         Assert.True(_syncPlayManager.IsUserActive(_userId));
         Assert.Single(_syncPlayManager.ListGroups(_session, new ListGroupsRequest()));
@@ -101,7 +101,7 @@ public class SyncPlayManagerReconnectTests : IDisposable
         RaiseSessionEnded();
         _syncPlayManager.LeaveGroup(_session, new LeaveGroupRequest(), CancellationToken.None);
 
-        await Task.Delay(_testGracePeriod * 5);
+        await Task.Delay(_testGracePeriod * 5, TestContext.Current.CancellationToken);
 
         Assert.False(_syncPlayManager.IsUserActive(_userId));
         _sessionManager.Verify(
@@ -121,7 +121,7 @@ public class SyncPlayManagerReconnectTests : IDisposable
         _syncPlayManager.JoinGroup(_session, new JoinGroupRequest(groupId), CancellationToken.None);
         _syncPlayManager.LeaveGroup(_session, new LeaveGroupRequest(), CancellationToken.None);
 
-        await Task.Delay(_testGracePeriod * 5);
+        await Task.Delay(_testGracePeriod * 5, TestContext.Current.CancellationToken);
 
         Assert.False(_syncPlayManager.IsUserActive(_userId));
     }
