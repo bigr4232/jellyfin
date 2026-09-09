@@ -69,9 +69,14 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
         private bool _startedBySeek;
 
         /// <summary>
-        /// Whether any session has reported buffering or readiness during this waiting cycle.
+        /// Whether any session has reported buffering during this waiting cycle.
         /// </summary>
-        private bool _sessionReported;
+        /// <remarks>
+        /// Only a Buffer report counts. A Ready report says the session is done, which is no
+        /// reason to keep waiting; a group where one client answers Ready and another stays
+        /// silent must still get the short seek deadline.
+        /// </remarks>
+        private bool _sessionBuffered;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="WaitingGroupState"/> class.
@@ -410,9 +415,10 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
                 InitialStateSet = true;
             }
 
-            // A session reporting anything means the group is not waiting on a client that
-            // has silently finished, so the short seek deadline no longer applies.
-            _sessionReported = true;
+            // A session reporting that it is buffering is genuinely still working through the
+            // seek, so the group is not waiting on a client that has silently finished and the
+            // short seek deadline no longer applies.
+            _sessionBuffered = true;
 
             // Make sure the client is playing the correct item.
             if (!request.PlaylistItemId.Equals(context.PlayQueue.GetPlayingItemPlaylistId()))
@@ -492,7 +498,11 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
                 InitialStateSet = true;
             }
 
-            _sessionReported = true;
+            // Deliberately does not set _sessionBuffered: a Ready report means this session is
+            // finished, not that it is still working through the seek. Letting it relax the
+            // deadline would hand the whole group the long timeout as soon as one well-behaved
+            // client answered, which is exactly the case the short seek deadline exists for.
+            // See finding #33 in syncplay-code-review.md.
 
             // Make sure the client is playing the correct item.
             if (!request.PlaylistItemId.Equals(context.PlayQueue.GetPlayingItemPlaylistId()))
@@ -1005,7 +1015,10 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
                 _waitingSession = session;
             }
 
-            var timeout = _startedBySeek && !_sessionReported ? SeekWaitTimeout : WaitTimeout;
+            // A seek keeps the short deadline until someone reports that it is actually still
+            // buffering. Peers answering Ready must not extend it: in a mixed group they answer
+            // within milliseconds while the silent client never will.
+            var timeout = _startedBySeek && !_sessionBuffered ? SeekWaitTimeout : WaitTimeout;
             context.ScheduleStateTimeout(timeout);
         }
 

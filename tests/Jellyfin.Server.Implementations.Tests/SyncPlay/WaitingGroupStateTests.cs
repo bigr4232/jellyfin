@@ -59,6 +59,11 @@ namespace Jellyfin.Server.Implementations.Tests.SyncPlay
             return new ReadyGroupRequest(DateTime.UtcNow, positionTicks, isPlaying, _context.PlaylistItemId);
         }
 
+        private BufferGroupRequest BufferRequest(long positionTicks, bool isPlaying)
+        {
+            return new BufferGroupRequest(DateTime.UtcNow, positionTicks, isPlaying, _context.PlaylistItemId);
+        }
+
         public void Dispose()
         {
             Dispose(true);
@@ -75,6 +80,11 @@ namespace Jellyfin.Server.Implementations.Tests.SyncPlay
         }
 
         private void HandleReady(ReadyGroupRequest request)
+        {
+            _state.HandleRequest(request, _context, GroupStateType.Waiting, _session, CancellationToken.None);
+        }
+
+        private void HandleBuffer(BufferGroupRequest request)
         {
             _state.HandleRequest(request, _context, GroupStateType.Waiting, _session, CancellationToken.None);
         }
@@ -382,16 +392,31 @@ namespace Jellyfin.Server.Implementations.Tests.SyncPlay
         }
 
         [Fact]
-        public void HandleRequest_Seek_AfterASessionReported_ArmsLongWaitTimeout()
+        public void HandleRequest_Seek_AfterASessionBuffered_ArmsLongWaitTimeout()
         {
             HandleSeek(TimeSpan.FromSeconds(30).Ticks, GroupStateType.Playing);
             _state.ResumePlaying = true;
 
-            // A session that reports is a session that is genuinely working through the seek,
-            // so the group goes back to giving it the full allowance.
-            HandleReady(ReadyRequest(_context.PositionTicks, isPlaying: true));
+            // A session that reports buffering is genuinely working through the seek, so the
+            // group goes back to giving it the full allowance.
+            HandleBuffer(BufferRequest(_context.PositionTicks, isPlaying: true));
 
             Assert.Equal(TimeSpan.FromSeconds(30), _context.LastScheduledTimeout);
+        }
+
+        [Fact]
+        public void HandleRequest_Seek_AfterAPeerReportedReady_KeepsShortWaitTimeout()
+        {
+            HandleSeek(TimeSpan.FromSeconds(30).Ticks, GroupStateType.Playing);
+            _state.ResumePlaying = true;
+
+            // A Ready report says that session is finished, not that it is still working. In a
+            // mixed group the well-behaved clients answer within milliseconds while the silent
+            // one never will, so their answers must not extend the group's deadline onto the
+            // 30 s allowance. See finding #33 in syncplay-code-review.md.
+            HandleReady(ReadyRequest(_context.PositionTicks, isPlaying: true));
+
+            Assert.Equal(TimeSpan.FromSeconds(2), _context.LastScheduledTimeout);
         }
 
         [Fact]
