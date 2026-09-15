@@ -5,6 +5,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
+using Jellyfin.Extensions;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.Session;
 using MediaBrowser.Controller.SyncPlay;
@@ -213,6 +214,15 @@ namespace Emby.Server.Implementations.SyncPlay
                 throw new InvalidOperationException("Request is null!");
             }
 
+            if (session.UserId.IsEmpty())
+            {
+                _logger.LogWarning("Session {SessionId} tried to join group {GroupId} without a user.", session.Id, request.GroupId);
+
+                var noUserError = new SyncPlayLibraryAccessDeniedUpdate(request.GroupId, string.Empty);
+                _sessionManager.SendSyncPlayGroupUpdate(session.Id, noUserError, CancellationToken.None);
+                return;
+            }
+
             var user = _userManager.GetUserById(session.UserId);
 
             // Locking required to access list of groups.
@@ -339,6 +349,12 @@ namespace Emby.Server.Implementations.SyncPlay
                 throw new InvalidOperationException("Request is null!");
             }
 
+            if (session.UserId.IsEmpty())
+            {
+                // A session with no user can access no group's queue.
+                return new List<GroupInfoDto>();
+            }
+
             var user = _userManager.GetUserById(session.UserId);
             List<GroupInfoDto> list = new List<GroupInfoDto>();
 
@@ -364,6 +380,12 @@ namespace Emby.Server.Implementations.SyncPlay
         public GroupInfoDto GetGroup(SessionInfo session, Guid groupId)
         {
             ArgumentNullException.ThrowIfNull(session);
+
+            if (session.UserId.IsEmpty())
+            {
+                // A session with no user can access no group's queue.
+                return null;
+            }
 
             var user = _userManager.GetUserById(session.UserId);
 
