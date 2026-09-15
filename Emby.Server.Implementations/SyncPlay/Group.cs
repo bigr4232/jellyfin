@@ -138,6 +138,13 @@ namespace Emby.Server.Implementations.SyncPlay
         internal long? GroupWaitDeadline { get; private set; }
 
         /// <summary>
+        /// Gets or sets the <see cref="Environment.TickCount64"/> value at which the current waiting
+        /// period started, or <c>null</c> when the group is not waiting for anyone.
+        /// </summary>
+        /// <value>The start of the waiting period.</value>
+        private long? GroupWaitStart { get; set; }
+
+        /// <summary>
         /// Gets the group identifier.
         /// </summary>
         /// <value>The group identifier.</value>
@@ -418,6 +425,28 @@ namespace Emby.Server.Implementations.SyncPlay
             }
 
             UpdateGroupWaitDeadline(false);
+        }
+
+        /// <inheritdoc />
+        public void LimitGroupWait(long timeout)
+        {
+            if (GroupWaitDeadline is null)
+            {
+                return;
+            }
+
+            GroupWaitDeadline = Math.Min(GroupWaitDeadline.Value, Environment.TickCount64 + timeout);
+        }
+
+        /// <inheritdoc />
+        public void RestoreGroupWait()
+        {
+            if (GroupWaitDeadline is null || GroupWaitStart is null)
+            {
+                return;
+            }
+
+            GroupWaitDeadline = Math.Max(GroupWaitDeadline.Value, GroupWaitStart.Value + GroupWaitTimeout);
         }
 
         /// <inheritdoc />
@@ -799,6 +828,7 @@ namespace Emby.Server.Implementations.SyncPlay
             if (_state.Type != GroupStateType.Waiting || !IsBuffering())
             {
                 GroupWaitDeadline = null;
+                GroupWaitStart = null;
                 return;
             }
 
@@ -806,7 +836,8 @@ namespace Emby.Server.Implementations.SyncPlay
             // reporting buffering while they load must not push it back.
             if (GroupWaitDeadline is null || startNewWaitingPeriod)
             {
-                GroupWaitDeadline = Environment.TickCount64 + GroupWaitTimeout;
+                GroupWaitStart = Environment.TickCount64;
+                GroupWaitDeadline = GroupWaitStart + GroupWaitTimeout;
             }
         }
     }

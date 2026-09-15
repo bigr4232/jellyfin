@@ -40,6 +40,26 @@ namespace MediaBrowser.Controller.SyncPlay
         long MaxCatchUpOffset => 60000;
 
         /// <summary>
+        /// Brings the current group-wait deadline forward to at most <paramref name="timeout"/> from now.
+        /// </summary>
+        /// <remarks>
+        /// Does nothing when the group is not waiting for anyone. A new waiting period starts with
+        /// the full allowance again.
+        /// </remarks>
+        /// <param name="timeout">The timeout, in milliseconds.</param>
+        void LimitGroupWait(long timeout)
+        {
+        }
+
+        /// <summary>
+        /// Gives the current waiting period back the full group-wait allowance it started with,
+        /// undoing <see cref="LimitGroupWait"/>.
+        /// </summary>
+        void RestoreGroupWait()
+        {
+        }
+
+        /// <summary>
         /// Gets the group identifier.
         /// </summary>
         /// <value>The group identifier.</value>
